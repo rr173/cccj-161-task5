@@ -6,6 +6,18 @@ import { buildReport } from './adjudication.js';
 import { seed, BASE_NOW, meterProfile, mulberry32, strSeed, dayValuesForKey } from './seed.js';
 import { EventStore, LogQuarantineError } from './store.js';
 import {
+  buildInstructions,
+  buildManifest,
+  canonicalManifest,
+  computeCheckpoint,
+  digestOf,
+  mergeSegment,
+  operatorKeyId,
+  segmentDigest,
+  signCanonical,
+  verifyBundle,
+  PACKAGE_OUTCOMES,
+} from './offline.js';import {
   INTERVAL_MS,
   INTERVALS_PER_DAY,
   canonicalJSON,
@@ -29,6 +41,15 @@ export class DomainError extends Error {
 
 const RECEIPT_STATUSES = ['ACCEPTED', 'DECLINED', 'EXECUTING', 'RECOVERED'];
 const EVENT_TERMINAL = new Set(['RECALLED', 'CLOSED']);
+
+// 分段条目的稳定形态（参与段摘要）：仅保留语义字段，reason 归一为字符串/null。
+function normalizeSegmentItem(raw) {
+  return {
+    seq: Number(raw?.seq),
+    outcome: String(raw?.outcome || ''),
+    reason: raw?.reason != null ? String(raw.reason).slice(0, 200) : null,
+  };
+}
 
 // 履约异议：裁定（报告）封存后 48 个仿真小时内可提异议；时限随 DISPUTE_FILED 记录落盘，
 // 重启重放后不变。审核结论 UPHELD（通过）/ REJECTED（驳回）为终态。
@@ -93,6 +114,9 @@ export class Kernel {
       offline: new Set(),
       disputes: new Map(), // disputeId -> 异议工单投影（待处理状态/时限/材料次序全部由记录重建）
       requests: new Map(), // requestId -> {op, bodyHash, disputeId, materialSeq?}（客户请求号幂等台账）
+      gateways: new Map(), // gatewayId -> {id,name}（现场网关，离线作业包的领取/执行单元）
+      packages: new Map(), // packageId -> 离线作业包投影（领取关系/围栏/台账/历史全部由记录重建）
+      packageDeviceIndex: new Map(), // deviceId -> packageId（仅未关闭包；不同包不得重复包含同一设备）
       genCursor: floorInterval(BASE_NOW),
     };
     this.clock = new Clock(BASE_NOW);
@@ -125,6 +149,9 @@ export class Kernel {
       case 'SEED_DEVICE':
         s.devices.set(p.id, { ...p });
         s.sheds.set(p.id, new Map());
+        break;
+      case 'SEED_GATEWAY':
+        s.gateways.set(p.id, { ...p });
         break;
       case 'SEED_DAY_READINGS':
         this.#putDay(p.meterId, p.day, p.values, rec.ts);
@@ -293,6 +320,105 @@ export class Kernel {
         s.requests.set(p.requestId, { op: rec.type, bodyHash: p.bodyHash, disputeId: p.disputeId });
         break;
       }
+      case 'PACKAGE_ISSUED': {
+        const pkg = {
+          packageId: p.packageId,
+          eventId: p.eventId,
+          manifest: { ...p.manifest },
+          manifestHash: p.manifestHash,
+          signature: p.signature,
+          keyId: p.keyId,
+          validUntil: p.manifest.validUntil,
+          status: 'OPEN', // OPEN / CLOSED
+          closeReason: null,
+          heldBy: null, // 当前领取网关
+          fence: 0, // 当前围栏号（递增；旧围栏回执必须失效）
+          receipts: new Map(), // seq -> {outcome, reason}，按包内序号合并的权威台账
+          pending: new Map(), // seq -> {outcome, reason}，乱序缺口挂起
+          seenSegments: new Map(), // segmentId -> {segmentHash, recordSeq}，幂等重传识别
+          checkpoint: null,
+          history: [{ type: 'ISSUED', at: p.at, recordSeq: rec.seq, createdBy: p.createdBy }],
+        };
+        s.packages.set(p.packageId, pkg);
+        for (const inst of p.manifest.instructions) {
+          s.packageDeviceIndex.set(inst.deviceId, p.packageId);
+        }
+        break;
+      }
+      case 'PACKAGE_CLAIMED': {
+        const pkg = s.packages.get(p.packageId);
+        if (pkg) {
+          pkg.heldBy = p.gatewayId;
+          pkg.fence = p.fence;
+          pkg.history.push({ type: 'CLAIMED', at: p.at, fence: p.fence, gatewayId: p.gatewayId, recordSeq: rec.seq });
+        }
+        break;
+      }
+      case 'PACKAGE_RELEASED': {
+        const pkg = s.packages.get(p.packageId);
+        if (pkg) {
+          // 释放只发生在首条执行回执前：没有已合并进度；挂起缺口与领取关系一并清空，
+          // 但释放事件本身保留在 history（此前证据不抹除）。
+          // 释放不占用新围栏号（当前无人持有）；重新领取时分配 fence+1。
+          // 旧领取者手上的 fence 与“无人持有”状态不匹配，任何回执一律 STALE_FENCE。
+          pkg.pending.clear();
+          pkg.heldBy = null;
+          pkg.history.push({ type: 'RELEASED', at: p.at, fence: p.fence, gatewayId: p.gatewayId, recordSeq: rec.seq });
+        }
+        break;
+      }
+      case 'PACKAGE_HANDED_OVER': {
+        const pkg = s.packages.get(p.packageId);
+        if (pkg) {
+          // 强制移交：此前证据（receipts/pending/seenSegments）全部保留，只轮换围栏与领取者
+          pkg.heldBy = p.toGatewayId;
+          pkg.fence = p.fence;
+          pkg.history.push({
+            type: 'HANDED_OVER', at: p.at, fence: p.fence,
+            fromGatewayId: p.fromGatewayId, toGatewayId: p.toGatewayId,
+            reason: p.reason, operator: p.operator, recordSeq: rec.seq,
+          });
+        }
+        break;
+      }
+      case 'PACKAGE_SEGMENT_ACCEPTED': {
+        const pkg = s.packages.get(p.packageId);
+        if (pkg && !pkg.seenSegments.has(p.segmentId)) {
+          // 权威结果以命令裁决时刻写入 payload 的 merged/buffered 为准（含缺口自动排水），
+          // 重放只重建台账，不重新裁决。
+          for (const r of p.merged) pkg.receipts.set(r.seq, { outcome: r.outcome, reason: r.reason ?? null });
+          for (const r of p.buffered) pkg.pending.set(r.seq, { outcome: r.outcome, reason: r.reason ?? null });
+          for (const seq of pkg.pending.keys()) {
+            if (pkg.receipts.has(seq)) pkg.pending.delete(seq);
+          }
+          pkg.seenSegments.set(p.segmentId, { segmentHash: p.segmentHash, recordSeq: rec.seq });
+          pkg.checkpoint = {
+            fence: p.fence, watermark: p.watermark, mergedCount: p.mergedCount,
+            pending: [...p.pendingSeqs].sort((a, b) => a - b), checkpoint: p.checkpoint,
+          };
+          pkg.history.push({
+            type: 'SEGMENT', at: p.at, fence: p.fence, gatewayId: p.gatewayId,
+            segmentId: p.segmentId, merged: p.merged.map((r) => r.seq),
+            buffered: p.buffered.map((r) => r.seq), watermark: p.watermark,
+            checkpoint: p.checkpoint, recordSeq: rec.seq,
+          });
+        }
+        break;
+      }
+      case 'PACKAGE_CLOSED': {
+        const pkg = s.packages.get(p.packageId);
+        if (pkg && pkg.status !== 'CLOSED') {
+          pkg.status = 'CLOSED';
+          pkg.closeReason = p.reason;
+          for (const inst of pkg.manifest.instructions) {
+            if (s.packageDeviceIndex.get(inst.deviceId) === p.packageId) {
+              s.packageDeviceIndex.delete(inst.deviceId);
+            }
+          }
+          pkg.history.push({ type: 'CLOSED', at: p.at, reason: p.reason, fence: p.fence, recordSeq: rec.seq });
+        }
+        break;
+      }
       default:
         break;
     }
@@ -346,6 +472,16 @@ export class Kernel {
         return this.supplementDispute(cmd, now);
       case 'RESOLVE_DISPUTE':
         return this.resolveDispute(cmd, now);
+      case 'ISSUE_PACKAGE':
+        return this.issuePackage(cmd, now);
+      case 'CLAIM_PACKAGE':
+        return this.claimPackage(cmd, now);
+      case 'RELEASE_PACKAGE':
+        return this.releasePackage(cmd, now);
+      case 'HANDOVER_PACKAGE':
+        return this.handoverPackage(cmd, now);
+      case 'UPLOAD_PACKAGE_SEGMENT':
+        return this.uploadPackageSegment(cmd, now);
       case 'TICK':
         return this.tick(cmd.minutes ?? 15, now);
       case 'RESET':
@@ -424,6 +560,14 @@ export class Kernel {
     if (EVENT_TERMINAL.has(ev.status)) {
       throw new DomainError('EVENT_TERMINAL', `事件已处于终态 ${ev.status}`, { status: ev.status });
     }
+    // 事件撤销：其全部未关闭作业包随之关闭（已领取者也不能再上传，旧围栏回执同样失效）
+    const packagesClosed = [];
+    for (const pkg of [...this.s.packages.values()]) {
+      if (pkg.eventId === ev.id && pkg.status === 'OPEN') {
+        this.#closePackage(pkg, 'EVENT_RECALLED', now);
+        packagesClosed.push(pkg.packageId);
+      }
+    }
     const released = [];
     this.store.append('EVENT_CANCELLED', { eventId: ev.id, at: now, reason: cmd.reason || '运营方撤销' }, now);
     this.apply(this.store.all().at(-1));
@@ -453,7 +597,7 @@ export class Kernel {
         report = this.issueReport(ev, { kind: 'ORIGINAL', reason: 'EVENT_RECALLED', cutoffTs: now });
       }
     }
-    return { eventId: ev.id, status: 'RECALLED', released, report };
+    return { eventId: ev.id, status: 'RECALLED', released, packagesClosed, report };
   }
 
   claimDevice(cmd, now) {
@@ -691,6 +835,12 @@ export class Kernel {
     this.apply(this.store.all().at(-1));
     this.store.append('EVENT_ACTIVATED', { eventId: ev.id, at: now }, now);
     this.apply(this.store.all().at(-1));
+    // 事件开始后不再允许领取新包：尚无人领取的包一律关闭（已被领取的包继续执行）。
+    for (const pkg of [...this.s.packages.values()]) {
+      if (pkg.eventId === ev.id && pkg.status === 'OPEN' && !pkg.heldBy) {
+        this.#closePackage(pkg, 'EVENT_STARTED', now);
+      }
+    }
     return payload;
   }
 
@@ -1036,6 +1186,320 @@ export class Kernel {
     return [...this.s.disputes.values()].map((d) => this.disputeView(d.disputeId));
   }
 
+  // ---------- 现场网关离线作业包 ----------
+
+  #requirePackage(packageId) {
+    const pkg = this.s.packages.get(packageId);
+    if (!pkg) throw new DomainError('PACKAGE_NOT_FOUND', `离线作业包 ${packageId} 不存在`, { packageId });
+    return pkg;
+  }
+
+  // 惰性关闭：有效期一过即关闭；返回 true 表示已（被本调用）关闭。
+  #expireIfDue(pkg, now) {
+    if (pkg.status === 'OPEN' && now > pkg.validUntil) {
+      this.#closePackage(pkg, 'EXPIRED', now);
+      return true;
+    }
+    return false;
+  }
+
+  #closePackage(pkg, reason, now) {
+    if (pkg.status === 'CLOSED') return;
+    this.store.append('PACKAGE_CLOSED', {
+      packageId: pkg.packageId, eventId: pkg.eventId, reason, at: now, fence: pkg.fence,
+    }, now);
+    this.apply(this.store.all().at(-1));
+  }
+
+  // 制包：运营方按一个【已发布事件的固定版本】切分设备批次，生成只读包。
+  issuePackage(cmd, now) {
+    const ev = this.requireEvent(cmd.eventId);
+    if (ev.status !== 'SCHEDULED') {
+      // 事件被撤销或开始后不再允许领取新包——制包同样冻结在“已发布（未开始、未撤销）”版本上
+      throw new DomainError('EVENT_NOT_SCHEDULED', `事件状态为 ${ev.status}，不能再制包/领新包`, { status: ev.status });
+    }
+    const rawDevices = Array.isArray(cmd.deviceIds) ? cmd.deviceIds : [];
+    if (!rawDevices.length) throw new DomainError('BAD_REQUEST', 'deviceIds 至少包含一台设备');
+    const deviceIds = [];
+    for (const d of rawDevices.map((x) => String(x))) {
+      if (deviceIds.includes(d)) {
+        throw new DomainError('DUPLICATE_DEVICE_IN_BATCH', `批次内设备 ${d} 重复`, { deviceId: d });
+      }
+      deviceIds.push(d);
+    }
+    const rows = [];
+    for (const deviceId of deviceIds) {
+      const dev = this.s.devices.get(deviceId);
+      if (!dev) throw new DomainError('NOT_FOUND', `设备 ${deviceId} 不存在`, { deviceId });
+      if (dev.meterId !== ev.meterId) {
+        throw new DomainError('METER_MISMATCH', '设备不属于该事件的计量点', { deviceId, deviceMeter: dev.meterId, eventMeter: ev.meterId });
+      }
+      // 不同包不得重复包含同一设备：以“未关闭包”索引判定（过期/撤销/完成关闭后释放）
+      const holder = this.s.packageDeviceIndex.get(deviceId);
+      if (holder) {
+        throw new DomainError('DEVICE_IN_OTHER_PACKAGE', `设备 ${deviceId} 已包含在未关闭包 ${holder} 中`, {
+          deviceId, otherPackageId: holder,
+        });
+      }
+      rows.push({ deviceId, maxKw: dev.maxKw });
+    }
+
+    let validUntil = Number(cmd.validUntilMs);
+    if (!Number.isFinite(validUntil)) validUntil = ev.endMs; // 默认与事件时窗同寿
+    if (validUntil <= now) throw new DomainError('BAD_REQUEST', '有效期 validUntilMs 必须晚于当前仿真时间');
+
+    const packageId = cmd.packageId || uid('PKG');
+    const instructions = buildInstructions(ev, rows);
+    // 固定版本锚点：事件发布记录的链哈希（该记录不可变；篡改即锚点失效）
+    const publishedRec = this.store.all().find((r) => r.type === 'EVENT_PUBLISHED' && r.payload.id === ev.id);
+    const eventRefHash = publishedRec.hash;
+    const manifest = buildManifest({ packageId, ev, eventRefHash, instructions, issuedAt: now, validUntil });
+    const canonical = canonicalManifest(manifest);
+    const manifestHash = digestOf(canonical);
+    const signature = signCanonical(canonical);
+
+    const payload = {
+      packageId,
+      eventId: ev.id,
+      manifest,
+      manifestHash,
+      signature,
+      keyId: operatorKeyId(),
+      at: now,
+      createdBy: cmd.createdBy || '运营方',
+    };
+    this.store.append('PACKAGE_ISSUED', payload, now);
+    this.apply(this.store.all().at(-1));
+    return { package: this.packageView(packageId), bundle: { canonical, manifestHash, signature, keyId: payload.keyId } };
+  }
+
+  // 网关领取：获得单调递增围栏号。旧领取者恢复联网后凭旧围栏上传一律 STALE_FENCE。
+  claimPackage(cmd, now) {
+    const pkg = this.#requirePackage(cmd.packageId);
+    const gatewayId = String(cmd.gatewayId || '');
+    if (!this.s.gateways.has(gatewayId)) throw new DomainError('NOT_FOUND', `网关 ${gatewayId} 不存在`, { gatewayId });
+    this.#expireIfDue(pkg, now);
+    if (pkg.status === 'CLOSED') {
+      throw new DomainError('PACKAGE_CLOSED', `作业包已关闭（${pkg.closeReason}），不能领取`, {
+        reason: pkg.closeReason, validUntil: pkg.validUntil,
+      });
+    }
+    if (pkg.heldBy) {
+      if (pkg.heldBy === gatewayId) {
+        // 同一网关超时重试领取：幂等返回当前围栏（不轮换、不追加记录）
+        return { idempotent: true, package: this.packageView(pkg.packageId), fence: pkg.fence, gatewayId };
+      }
+      throw new DomainError('PACKAGE_HELD', `作业包由网关 ${pkg.heldBy} 持有中（围栏 ${pkg.fence}）`, {
+        heldBy: pkg.heldBy, fence: pkg.fence,
+      });
+    }
+    // 事件开始后不允许领取新包（已被领取的包仍可继续执行直至过期/撤销）
+    const ev = this.s.events.get(pkg.eventId);
+    if (ev && ev.status !== 'SCHEDULED') {
+      this.#closePackage(pkg, 'EVENT_STARTED', now);
+      throw new DomainError('PACKAGE_CLAIM_WINDOW_CLOSED', `事件已 ${ev.status}，未领取包不再允许领取`, { status: ev.status });
+    }
+    const fence = pkg.fence + 1;
+    this.store.append('PACKAGE_CLAIMED', { packageId: pkg.packageId, gatewayId, fence, at: now }, now);
+    this.apply(this.store.all().at(-1));
+    return { claimed: true, package: this.packageView(pkg.packageId), fence, gatewayId };
+  }
+
+  // 释放：仅首条执行回执前（无任何已合并进度）可由当前领取网关自助释放并重新领取。
+  releasePackage(cmd, now) {
+    const pkg = this.#requirePackage(cmd.packageId);
+    const gatewayId = String(cmd.gatewayId || '');
+    if (pkg.status === 'CLOSED') {
+      throw new DomainError('PACKAGE_CLOSED', `作业包已关闭（${pkg.closeReason}），不能释放`, { reason: pkg.closeReason });
+    }
+    if (!pkg.heldBy) throw new DomainError('PACKAGE_NOT_CLAIMED', '作业包未被领取，无需释放');
+    if (pkg.heldBy !== gatewayId) {
+      throw new DomainError('NOT_PACKAGE_HOLDER', `只有持有网关 ${pkg.heldBy} 可以释放`, { heldBy: pkg.heldBy });
+    }
+    if (Number(cmd.fence) !== pkg.fence) {
+      // 旧围栏（已被移交/重新领取轮换）不允许释放当前领取关系
+      throw new DomainError('STALE_FENCE', `围栏号 ${cmd.fence} 已失效（当前 ${pkg.fence}）`, { currentFence: pkg.fence });
+    }
+    if (pkg.receipts.size > 0) {
+      throw new DomainError('PACKAGE_PROGRESS_LOCKED',
+        '已有合并进度（执行/跳过/失败回执），不可自助释放；只能由运营人员强制移交', { mergedCount: pkg.receipts.size });
+    }
+    this.store.append('PACKAGE_RELEASED', {
+      packageId: pkg.packageId, eventId: pkg.eventId, gatewayId, fence: pkg.fence, at: now,
+    }, now);
+    this.apply(this.store.all().at(-1));
+    return { released: true, package: this.packageView(pkg.packageId), nextFence: pkg.fence + 1 };
+  }
+
+  // 强制移交：已有进度后只能由运营人员执行；保留此前证据并轮换围栏号。
+  handoverPackage(cmd, now) {
+    const pkg = this.#requirePackage(cmd.packageId);
+    const toGatewayId = String(cmd.toGatewayId || '');
+    if (!this.s.gateways.has(toGatewayId)) throw new DomainError('NOT_FOUND', `网关 ${toGatewayId} 不存在`, { gatewayId: toGatewayId });
+    this.#expireIfDue(pkg, now);
+    if (pkg.status === 'CLOSED') {
+      throw new DomainError('PACKAGE_CLOSED', `作业包已关闭（${pkg.closeReason}），不能移交`, { reason: pkg.closeReason });
+    }
+    if (!pkg.heldBy) throw new DomainError('PACKAGE_NOT_CLAIMED', '作业包未被领取；请直接领取，无需移交');
+    if (pkg.heldBy === toGatewayId) {
+      throw new DomainError('BAD_REQUEST', '目标网关已是当前持有网关');
+    }
+    // 移交竞争（乐观并发）：运营台若带 expectedFence，必须与当前围栏一致
+    if (cmd.expectedFence != null && Number(cmd.expectedFence) !== pkg.fence) {
+      throw new DomainError('FENCE_CONFLICT',
+        `移交竞争：期望围栏 ${cmd.expectedFence}，当前围栏 ${pkg.fence}（领取关系已变化，请刷新）`, { currentFence: pkg.fence });
+    }
+    const fromGatewayId = pkg.heldBy;
+    const fence = pkg.fence + 1;
+    this.store.append('PACKAGE_HANDED_OVER', {
+      packageId: pkg.packageId, eventId: pkg.eventId,
+      fromGatewayId, toGatewayId, fence,
+      reason: cmd.reason || '运营人员强制移交', operator: cmd.operator || '运营方', at: now,
+    }, now);
+    this.apply(this.store.all().at(-1));
+    return { handedOver: true, package: this.packageView(pkg.packageId), fence, fromGatewayId, toGatewayId };
+  }
+
+  // 分段上传已执行/跳过/失败回执：全部校验通过后才原子合并；
+  // 完全相同的分段重传不重复计数，返回稳定检查点。
+  uploadPackageSegment(cmd, now) {
+    const pkg = this.#requirePackage(cmd.packageId);
+    const gatewayId = String(cmd.gatewayId || '');
+    const fence = Number(cmd.fence);
+    const segmentId = String(cmd.segmentId || '');
+    if (!segmentId) throw new DomainError('BAD_REQUEST', 'segmentId 必填（分段幂等键）');
+    if (!this.s.gateways.has(gatewayId)) throw new DomainError('NOT_FOUND', `网关 ${gatewayId} 不存在`, { gatewayId });
+    if (!Number.isInteger(fence) || fence <= 0) throw new DomainError('BAD_REQUEST', 'fence 必须为正整数');
+
+    const items = Array.isArray(cmd.items) ? cmd.items : [];
+    // 段内容摘要：服务端自行按包ID+段号+规范化条目复算，防止客户端伪造摘要冒充重传。
+    const recomputedSegmentHash = segmentDigest(pkg.packageId, segmentId, items.map(normalizeSegmentItem));
+
+    // 幂等快路径最先：完全相同的分段重传（含包已关闭/已完成的旧段）不重复计数、
+    // 不追加记录，原样返回稳定检查点（上传超时重试安全）。
+    const seen = pkg.seenSegments.get(segmentId);
+    if (seen) {
+      if (seen.segmentHash !== recomputedSegmentHash) {
+        throw new DomainError('SEGMENT_CONFLICT',
+          `分段 ${segmentId} 已以不同内容上传（序号内容变化/重传不一致）`, { segmentId });
+      }
+      const cp = this.#checkpointOf(pkg);
+      return { duplicate: true, package: this.packageView(pkg.packageId), ...cp, closed: pkg.status === 'CLOSED' };
+    }
+
+    // 已关闭包先于围栏判定：当前持有者对“撤销/过期/已完成”包的新上传得到 PACKAGE_CLOSED；
+    // 旧领取者（heldBy 已换人）与错误围栏则在下面的围栏闸被识别为 STALE_FENCE。
+    this.#expireIfDue(pkg, now);
+    if (pkg.status === 'CLOSED') {
+      if (pkg.heldBy === gatewayId && fence === pkg.fence) {
+        throw new DomainError('PACKAGE_CLOSED',
+          `作业包已关闭（${pkg.closeReason}），新回执一律拒绝`, { reason: pkg.closeReason });
+      }
+      // 非当前持有者访问已关闭包：围栏语义优先（旧领取者恢复联网）
+      throw new DomainError('STALE_FENCE',
+        `围栏 ${fence}（网关 ${gatewayId}）已失效；作业包已关闭（${pkg.closeReason}），当前围栏 ${pkg.fence}`,
+        { currentFence: pkg.fence, heldBy: pkg.heldBy, closedReason: pkg.closeReason });
+    }
+
+    // 围栏闸口：旧领取者恢复联网后的回执必须被识别失效，绝不覆盖新领取者进度。
+    if (pkg.heldBy !== gatewayId || fence !== pkg.fence) {
+      throw new DomainError('STALE_FENCE',
+        `围栏 ${fence}（网关 ${gatewayId}）已失效；当前持有者 ${pkg.heldBy ?? '无'}，围栏 ${pkg.fence}`,
+        { currentFence: pkg.fence, heldBy: pkg.heldBy });
+    }
+
+    // 清单摘要不匹配：网关手里的只读包与服务端固定版本不一致
+    if (cmd.manifestHash && cmd.manifestHash !== pkg.manifestHash) {
+      throw new DomainError('PACKAGE_DIGEST_MISMATCH', '上传包摘要与服务端固定版本不一致（只读包被改动）', {
+        expected: pkg.manifestHash, provided: cmd.manifestHash,
+      });
+    }
+    if (cmd.segmentHash && cmd.segmentHash !== recomputedSegmentHash) {
+      throw new DomainError('SEGMENT_DIGEST_MISMATCH', '分段摘要不匹配（内容与摘要不符）', {
+        expected: recomputedSegmentHash, provided: cmd.segmentHash,
+      });
+    }
+    if (!items.length) throw new DomainError('BAD_REQUEST', '分段 items 不能为空');
+
+    const seqToDevice = new Map(pkg.manifest.instructions.map((i) => [i.seq, i.deviceId]));
+    const normalized = [];
+    const seqsInSegment = new Set();
+    for (const raw of items) {
+      const seq = Number(raw?.seq);
+      if (!Number.isInteger(seq)) throw new DomainError('BAD_REQUEST', '回执序号 seq 必须为整数');
+      // 越界序号：包内不存在的指令序号（含非正数）
+      if (!seqToDevice.has(seq)) {
+        throw new DomainError('SEQ_OUT_OF_RANGE', `序号 ${seq} 不在包指令范围 1..${seqToDevice.size} 内`, {
+          seq, range: seqToDevice.size,
+        });
+      }
+      const outcome = String(raw?.outcome || '');
+      if (!PACKAGE_OUTCOMES.includes(outcome)) {
+        throw new DomainError('BAD_REQUEST', `回执结果必须是 ${PACKAGE_OUTCOMES.join('/')}`);
+      }
+      // 越界设备：声明的 deviceId 不属于该序号（防止拿A包/他包设备回执冒充）
+      if (raw.deviceId != null && String(raw.deviceId) !== seqToDevice.get(seq)) {
+        throw new DomainError('DEVICE_OUT_OF_SCOPE', `序号 ${seq} 属于设备 ${seqToDevice.get(seq)}，不是 ${raw.deviceId}`, {
+          seq, expectedDevice: seqToDevice.get(seq), providedDevice: String(raw.deviceId),
+        });
+      }
+      if (seqsInSegment.has(seq)) {
+        throw new DomainError('BAD_REQUEST', `分段内序号 ${seq} 重复`);
+      }
+      seqsInSegment.add(seq);
+      const it = { seq, outcome, reason: raw.reason != null ? String(raw.reason).slice(0, 200) : null };
+      // 序号内容变化：同一序号此前已合并/挂起的结果不同 -> 明确拒绝（不可改写）
+      const known = pkg.receipts.get(seq) || pkg.pending.get(seq);
+      if (known && (known.outcome !== it.outcome || (known.reason ?? null) !== it.reason)) {
+        throw new DomainError('SEQ_CONTENT_CONFLICT',
+          `序号 ${seq} 内容与此前回执不一致（${known.outcome} -> ${it.outcome}）`, { seq });
+      }
+      normalized.push(it);
+    }
+
+    // 全部校验通过：纯函数式合并（缺口挂起 + 自动排水），再落一条只增记录
+    const pendingBefore = new Set(pkg.pending.keys());
+    const receipts = new Map(pkg.receipts);
+    const pending = new Map(pkg.pending);
+    const merged = mergeSegment(receipts, pending, normalized);
+    // 本段新增的挂起序号 = 本段带去、未排水且此前不在挂起集合的序号
+    const buffered = normalized
+      .filter((it) => pending.has(it.seq) && !receipts.has(it.seq) && !merged.some((m) => m.seq === it.seq))
+      .filter((it) => !pendingBefore.has(it.seq))
+      .map((it) => ({ seq: it.seq, outcome: it.outcome, reason: it.reason }));
+    const pendingSeqs = [...pending.keys()].sort((a, b) => a - b);
+    const cp = computeCheckpoint(pkg.packageId, fence, receipts, pendingSeqs);
+    const completed = receipts.size === seqToDevice.size;
+
+    this.store.append('PACKAGE_SEGMENT_ACCEPTED', {
+      packageId: pkg.packageId, eventId: pkg.eventId,
+      gatewayId, fence, segmentId, segmentHash: recomputedSegmentHash,
+      items: normalized, merged, buffered,
+      watermark: cp.watermark, mergedCount: cp.mergedCount, pendingSeqs,
+      checkpoint: cp.checkpoint, completed, at: now,
+    }, now);
+    this.apply(this.store.all().at(-1));
+    if (completed) this.#closePackage(this.s.packages.get(pkg.packageId), 'COMPLETED', now);
+
+    return {
+      accepted: true,
+      package: this.packageView(pkg.packageId),
+      duplicate: false,
+      merged: merged.map((m) => m.seq),
+      buffered: buffered.map((b) => b.seq),
+      bufferedOut: buffered.length > 0,
+      ...cp,
+      closed: completed,
+    };
+  }
+
+  #checkpointOf(pkg) {
+    if (!pkg.checkpoint) {
+      return computeCheckpoint(pkg.packageId, pkg.fence, pkg.receipts, [...pkg.pending.keys()]);
+    }
+    return { ...pkg.checkpoint };
+  }
+
   // ---------- 仿真推进 ----------
 
   tick(minutes, prevNow) {
@@ -1047,8 +1511,21 @@ export class Kernel {
     const frozen = this.freezeDue(to);
     const generated = this.#generateSimReadings(to);
     const closed = this.closeDue(to);
+    const expiredPackages = this.#expirePackagesDue(to);
 
-    return { now: to, iso: iso(to), frozen, closed, generatedIntervals: generated };
+    return { now: to, iso: iso(to), frozen, closed, expiredPackages, generatedIntervals: generated };
+  }
+
+  // 有效期到期的未关闭包一律关闭（过期后既不能领取，也不能上传）
+  #expirePackagesDue(now) {
+    const expired = [];
+    for (const pkg of this.s.packages.values()) {
+      if (pkg.status === 'OPEN' && now > pkg.validUntil) {
+        this.#closePackage(pkg, 'EXPIRED', now);
+        expired.push(pkg.packageId);
+      }
+    }
+    return expired;
   }
 
   #generateSimReadings(now) {
@@ -1180,6 +1657,7 @@ export class Kernel {
       readOnly: !chain.writable,
       recovery: chain.recovery,
       aggregators: [...this.s.aggregators.values()],
+      gateways: [...this.s.gateways.values()],
       meters: [...this.s.meters.values()].map((m) => ({ ...m, offline: this.s.offline.has(m.id) })),
       devices: [...this.s.devices.values()].map((d) => {
         const claim = this.s.claims.get(d.id);
@@ -1193,12 +1671,73 @@ export class Kernel {
             watermark: claim.appliedSeq,
             lastAckAt: claim.lastAckAt,
           } : null,
+          packageId: this.s.packageDeviceIndex.get(d.id) ?? null,
           buffered: (this.s.buffers.get(d.id) || []).length,
         };
       }),
       events: [...this.s.events.values()].map((e) => this.eventView(e.id)),
+      packages: this.listPackages(),
       disputes: this.listDisputes(),
       chain: this.store.verify(),
     };
+  }
+
+  // ---------- 离线作业包视图 ----------
+
+  packageView(id) {
+    const pkg = this.s.packages.get(id);
+    if (!pkg) return null;
+    const cp = this.#checkpointOf(pkg);
+    const counts = { EXECUTED: 0, SKIPPED: 0, FAILED: 0 };
+    for (const r of pkg.receipts.values()) counts[r.outcome]++;
+    return {
+      packageId: pkg.packageId,
+      eventId: pkg.eventId,
+      meterId: pkg.manifest.meterId,
+      status: pkg.status,
+      closeReason: pkg.closeReason,
+      validUntil: pkg.validUntil,
+      validUntilIso: iso(pkg.validUntil),
+      expired: this.now() > pkg.validUntil,
+      issuedAt: pkg.manifest.issuedAt,
+      issuedAtIso: iso(pkg.manifest.issuedAt),
+      heldBy: pkg.heldBy,
+      fence: pkg.fence,
+      manifestHash: pkg.manifestHash,
+      keyId: pkg.keyId,
+      signature: pkg.signature,
+      deviceIds: pkg.manifest.instructions.map((i) => i.deviceId),
+      instructions: pkg.manifest.instructions.map((i) => ({ ...i })),
+      eventRefHash: pkg.manifest.eventRefHash,
+      eventVersion: pkg.manifest.eventVersion,
+      totalCount: pkg.manifest.instructions.length,
+      mergedCount: pkg.receipts.size,
+      pendingSeqs: [...pkg.pending.keys()].sort((a, b) => a - b),
+      counts,
+      checkpoint: cp.checkpoint,
+      watermark: cp.watermark,
+      history: pkg.history.map((h) => ({ ...h })),
+    };
+  }
+
+  listPackages() {
+    return [...this.s.packages.values()].map((p) => this.packageView(p.packageId));
+  }
+
+  // 独立复核只读包：重算清单摘要 + Ed25519 验签
+  verifyPackageView(id, publicKeyPem) {
+    const pkg = this.s.packages.get(id);
+    if (!pkg) return null;
+    return verifyBundle(pkg.manifest, pkg.manifestHash, pkg.signature, publicKeyPem);
+  }
+
+  packageAuditView(id) {
+    const v = this.packageView(id);
+    if (!v) return null;
+    // 审计历史：包时间线 + 每条相关记录的链上锚点（seq/hash），可独立核验
+    const records = this.store.all()
+      .filter((r) => r.payload?.packageId === id)
+      .map((r) => ({ seq: r.seq, ts: r.ts, type: r.type, hash: r.hash, prevHash: r.prevHash, payload: r.payload }));
+    return { ...v, records };
   }
 }

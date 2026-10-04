@@ -6,6 +6,7 @@ import { dirname, join, extname, normalize } from 'node:path';
 import { Kernel } from './kernel.js';
 import { EventStore } from './store.js';
 import { sha256Hex, canonicalJSON } from './util.js';
+import { operatorKeyId, operatorPublicKeyPem } from './offline.js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const PUBLIC_DIR = join(__dirname, '..', 'public');
@@ -234,6 +235,98 @@ const server = createServer(async (req, res) => {
       return send(res, 200, out);
     }
 
+    // ---- 现场网关离线作业包 ----
+    if (path === '/api/packages' && req.method === 'POST') {
+      const cmd = {
+        type: 'ISSUE_PACKAGE',
+        eventId: body.eventId,
+        deviceIds: body.deviceIds,
+        createdBy: body.createdBy,
+      };
+      if (body.validUntilMs != null) cmd.validUntilMs = Number(body.validUntilMs);
+      if (body.validityMinutes != null) {
+        cmd.validUntilMs = kernel.now() + Number(body.validityMinutes) * 60000;
+      }
+      const out = kernel.dispatch(cmd);
+      return send(res, 201, out);
+    }
+    if (path === '/api/packages' && req.method === 'GET') {
+      let list = kernel.listPackages();
+      const eventId = url.searchParams.get('eventId');
+      const status = url.searchParams.get('status');
+      if (eventId) list = list.filter((p) => p.eventId === eventId);
+      if (status) list = list.filter((p) => p.status === status);
+      return send(res, 200, { count: list.length, packages: list });
+    }
+    const pkgGet = path.match(/^\/api\/packages\/([^/]+)$/);
+    if (pkgGet && req.method === 'GET') {
+      const view = kernel.packageView(decodeURIComponent(pkgGet[1]));
+      if (!view) return send(res, 404, { error: '作业包不存在', code: 'PACKAGE_NOT_FOUND' });
+      return send(res, 200, view);
+    }
+    const pkgVerify = path.match(/^\/api\/packages\/([^/]+)\/verify$/);
+    if (pkgVerify && req.method === 'GET') {
+      const id = decodeURIComponent(pkgVerify[1]);
+      const view = kernel.verifyPackageView(id);
+      if (!view) return send(res, 404, { error: '作业包不存在', code: 'PACKAGE_NOT_FOUND' });
+      return send(res, 200, view);
+    }
+    const pkgAudit = path.match(/^\/api\/packages\/([^/]+)\/audit$/);
+    if (pkgAudit && req.method === 'GET') {
+      const view = kernel.packageAuditView(decodeURIComponent(pkgAudit[1]));
+      if (!view) return send(res, 404, { error: '作业包不存在', code: 'PACKAGE_NOT_FOUND' });
+      return send(res, 200, view);
+    }
+    const pkgClaim = path.match(/^\/api\/packages\/([^/]+)\/claim$/);
+    if (pkgClaim && req.method === 'POST') {
+      const out = kernel.dispatch({
+        type: 'CLAIM_PACKAGE',
+        packageId: decodeURIComponent(pkgClaim[1]),
+        gatewayId: body.gatewayId,
+      });
+      return send(res, out.idempotent ? 200 : 201, out);
+    }
+    const pkgRelease = path.match(/^\/api\/packages\/([^/]+)\/release$/);
+    if (pkgRelease && req.method === 'POST') {
+      return send(res, 200, kernel.dispatch({
+        type: 'RELEASE_PACKAGE',
+        packageId: decodeURIComponent(pkgRelease[1]),
+        gatewayId: body.gatewayId,
+        fence: Number(body.fence),
+      }));
+    }
+    const pkgHandover = path.match(/^\/api\/packages\/([^/]+)\/handover$/);
+    if (pkgHandover && req.method === 'POST') {
+      const cmd = {
+        type: 'HANDOVER_PACKAGE',
+        packageId: decodeURIComponent(pkgHandover[1]),
+        toGatewayId: body.toGatewayId,
+        reason: body.reason,
+        operator: body.operator,
+      };
+      if (body.expectedFence != null) cmd.expectedFence = Number(body.expectedFence);
+      return send(res, 200, kernel.dispatch(cmd));
+    }
+    const pkgSegment = path.match(/^\/api\/packages\/([^/]+)\/segments$/);
+    if (pkgSegment && req.method === 'POST') {
+      const out = kernel.dispatch({
+        type: 'UPLOAD_PACKAGE_SEGMENT',
+        packageId: decodeURIComponent(pkgSegment[1]),
+        gatewayId: body.gatewayId,
+        fence: Number(body.fence),
+        segmentId: body.segmentId,
+        items: body.items,
+        manifestHash: body.manifestHash,
+        segmentHash: body.segmentHash,
+      });
+      // 202：本段有新增挂起缺口（水位尚未推进到这些序号）；200：已落定或纯重传
+      const buffered = !out.duplicate && (out.buffered?.length > 0);
+      return send(res, buffered ? 202 : 200, out);
+    }
+    if (path === '/api/operator-key' && req.method === 'GET') {
+      return send(res, 200, { keyId: operatorKeyId(), publicKeyPem: operatorPublicKeyPem() });
+    }
+
     // 报告详情 / 校验
     const reportMatch = path.match(/^\/api\/reports\/([^/]+)\/versions\/(\d+)$/);
     if (reportMatch && req.method === 'GET') {
@@ -276,6 +369,16 @@ const server = createServer(async (req, res) => {
       REQUEST_ID_CONFLICT: 409, DISPUTE_PENDING_EXISTS: 409, DISPUTE_DEADLINE_PASSED: 409,
       DISPUTE_TERMINAL: 409, DISPUTE_OWNER_MISMATCH: 409, MATERIAL_SEQ_CONFLICT: 409,
       REPORT_HASH_MISMATCH: 409, REPORT_NOT_FOUND: 404, DISPUTE_NOT_FOUND: 404,
+      PACKAGE_NOT_FOUND: 404,
+      DUPLICATE_DEVICE_IN_BATCH: 409, DEVICE_IN_OTHER_PACKAGE: 409,
+      EVENT_NOT_SCHEDULED: 409, PACKAGE_HELD: 409, NOT_PACKAGE_HOLDER: 409,
+      PACKAGE_PROGRESS_LOCKED: 409, STALE_FENCE: 409, FENCE_CONFLICT: 409,
+      PACKAGE_CLAIM_WINDOW_CLOSED: 409, SEGMENT_CONFLICT: 409,
+      SEQ_CONTENT_CONFLICT: 409,
+      PACKAGE_CLOSED: 410, PACKAGE_EXPIRED: 410,
+      PACKAGE_DIGEST_MISMATCH: 422, SEGMENT_DIGEST_MISMATCH: 422,
+      DEVICE_OUT_OF_SCOPE: 422, SEQ_OUT_OF_RANGE: 422,
+      PACKAGE_NOT_CLAIMED: 409,
       LOG_QUARANTINED: 503,
       UNKNOWN_COMMAND: 400,
     };

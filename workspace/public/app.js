@@ -50,6 +50,8 @@ function render() {
   renderChain();
   renderDisputeForm();
   renderDisputes();
+  renderPackageForms();
+  renderPackages();
   if (!$('evMeter').dataset.filled) {
     $('evMeter').innerHTML = STATE.meters.map((m) => `<option value="${m.id}">${m.id} · ${m.name}</option>`).join('');
     $('evMeter').dataset.filled = '1';
@@ -555,3 +557,208 @@ async function resolveDispute(disputeId, outcome) {
 
 refresh();
 timer = setInterval(refresh, 2500);
+
+/* ---------- 现场网关离线作业包 ---------- */
+
+function renderPackageForms() {
+  const scheduled = (STATE.events || []).filter((e) => e.status === 'SCHEDULED')
+    .sort((a, b) => a.startMs - b.startMs);
+  const evSel = $('pkgEvent');
+  const prevEv = evSel.value;
+  evSel.innerHTML = scheduled.length
+    ? scheduled.map((e) => `<option value="${e.id}">${e.id} · ${e.meterId} · 开始 ${fmtTs(e.startMs)}（${e.devices?.length || ''}）</option>`).join('')
+    : '<option value="">（无已发布未开始事件）</option>';
+  if ([...evSel.options].some((o) => o.value === prevEv)) evSel.value = prevEv;
+
+  const ev = scheduled.find((e) => e.id === evSel.value) || scheduled[0];
+  const box = $('pkgDevices');
+  if (ev) {
+    const devs = STATE.devices.filter((d) => d.meterId === ev.meterId);
+    box.innerHTML = devs.map((d) => {
+      const used = d.packageId && d.packageId !== null;
+      return `<label style="display:flex;gap:7px;align-items:center;margin:3px 0;color:${used ? 'var(--muted)' : 'var(--txt)'}">
+        <input type="checkbox" style="width:auto" value="${d.id}" ${used ? 'disabled' : ''}>
+        <span><b>${d.id}</b> ${esc(d.name)} · 额定 ${d.maxKw}kW
+        ${used ? `<span class="pill">已在包 ${d.packageId}</span>` : ''}</span>
+      </label>`;
+    }).join('');
+  } else {
+    box.innerHTML = '<span class="muted">请先发布一个未来开始的事件。</span>';
+  }
+
+  const gw = $('pkgGateway');
+  if (!gw.dataset.filled) {
+    gw.innerHTML = (STATE.gateways || []).map((g) => `<option value="${g.id}">${g.id} · ${esc(g.name)}</option>`).join('');
+    gw.dataset.filled = '1';
+  }
+}
+
+async function issuePackage() {
+  const eventId = $('pkgEvent').value;
+  if (!eventId) return toast('没有可选的已发布事件', 'err');
+  const deviceIds = [...$('pkgDevices').querySelectorAll('input:checked')].map((c) => c.value);
+  if (!deviceIds.length) return toast('至少勾选一台设备', 'err');
+  const ttl = Number($('pkgTtl').value);
+  try {
+    const body = { eventId, deviceIds };
+    if (ttl > 0) body.validityMinutes = ttl;
+    const r = await api('/api/packages', body);
+    toast(`只读包 <b>${r.package.packageId}</b> 已生成：${deviceIds.length} 台设备，摘要 ${r.bundle.manifestHash.slice(0, 12)}…（Ed25519 已签名）`, 'ok');
+    refresh();
+  } catch (e) { errToast(e); }
+}
+
+function renderPackages() {
+  const list = [...(STATE.packages || [])].sort((a, b) => b.issuedAt - a.issuedAt);
+  if (!list.length) { $('packages').className = 'muted'; $('packages').textContent = '尚无作业包。先在左侧发布事件并制包。'; return; }
+  $('packages').className = '';
+  $('packages').innerHTML = list.map((p) => {
+    const gw = $('pkgGateway')?.value;
+    const isHolder = gw && p.heldBy === gw;
+    const remainMin = Math.floor((p.validUntil - STATE.now) / 60000);
+    const pct = Math.round((p.mergedCount / p.totalCount) * 100);
+    const reasonTxt = { EXPIRED: '已过期', EVENT_RECALLED: '事件撤销', EVENT_STARTED: '事件开始（未领取）', COMPLETED: '全部完成' }[p.closeReason] || p.closeReason || '';
+    return `<div class="card ${p.status === 'OPEN' ? 'active' : 'closed'}">
+      <div class="row" style="justify-content:space-between">
+        <b>${p.packageId}</b>
+        <span class="tag ${p.status}">${p.status === 'OPEN' ? '可领取/执行' : `已关闭 · ${reasonTxt}`}</span>
+      </div>
+      <div class="muted mono" style="margin:4px 0;font-size:11.5px">
+        事件 ${p.eventId}（固定版本 v${p.eventVersion}）· ${p.meterId}<br>
+        设备 ${p.deviceIds.join(', ')}<br>
+        有效期至 ${fmtTs(p.validUntil)}${p.status === 'OPEN' ? `（剩 ${remainMin} 分钟）` : ''}<br>
+        摘要 ${p.manifestHash.slice(0, 16)}… ｜ 签名 ${p.signature.slice(0, 16)}…
+      </div>
+      <div class="row" style="gap:6px;font-size:12px">
+        <span>持有者：<b>${p.heldBy || '—'}</b></span>
+        <span class="pill">围栏 ${p.fence}</span>
+        <span class="pill">水位 ${p.watermark}/${p.totalCount}</span>
+        <span class="tag EXECUTED">执行 ${p.counts.EXECUTED}</span>
+        <span class="tag SKIPPED">跳过 ${p.counts.SKIPPED}</span>
+        <span class="tag FAILED">失败 ${p.counts.FAILED}</span>
+        ${p.pendingSeqs.length ? `<span class="pill" title="乱序挂起缺口">挂起 ${p.pendingSeqs.join(',')}</span>` : ''}
+      </div>
+      <div class="bar"><i style="width:${pct}%"></i></div>
+      <div class="muted mono" style="font-size:10.5px;margin-top:2px">检查点 ${p.checkpoint.slice(0, 20)}…</div>
+      <div class="btns" style="margin-top:6px">
+        ${p.status === 'OPEN' && !p.heldBy ? `<button class="good" onclick="claimPkg('${p.packageId}')">领取（当前网关）</button>` : ''}
+        ${p.status === 'OPEN' && isHolder ? `
+          <button class="good" onclick="uploadSeg('${p.packageId}',${p.fence},'EXECUTED')">上传执行</button>
+          <button class="warn" onclick="uploadSeg('${p.packageId}',${p.fence},'SKIPPED')">跳过下一个</button>
+          <button class="bad" onclick="uploadSeg('${p.packageId}',${p.fence},'FAILED')">上报失败</button>
+          <button class="ghost" onclick="uploadGapSeg('${p.packageId}',${p.fence})">↕ 乱序高位分段</button>
+          <button class="ghost" onclick="releasePkg('${p.packageId}',${p.fence})">释放</button>` : ''}
+        ${p.status === 'OPEN' && p.heldBy && !isHolder ? `
+          <button class="warn" onclick="handoverPkg('${p.packageId}',${p.fence})">运营强制移交到当前网关</button>` : ''}
+        <button class="ghost" onclick="staleFenceDemo('${p.packageId}')">模拟旧围栏回执</button>
+        <button class="ghost" onclick="verifyPkg('${p.packageId}')">验签</button>
+        <button class="ghost" onclick="toggleAudit('${p.packageId}',this)">审计历史</button>
+      </div>
+      <div id="aud-${p.packageId}" hidden></div>
+    </div>`;
+  }).join('');
+}
+
+async function claimPkg(pid) {
+  try {
+    const r = await api(`/api/packages/${encodeURIComponent(pid)}/claim`, { gatewayId: $('pkgGateway').value });
+    toast(r.idempotent ? '该网关已持有此包（幂等返回围栏）' : `领取成功，围栏号 <b>${r.fence}</b>`, 'ok');
+    refresh();
+  } catch (e) { errToast(e); }
+}
+
+async function releasePkg(pid, fence) {
+  try {
+    const r = await api(`/api/packages/${encodeURIComponent(pid)}/release`, { gatewayId: $('pkgGateway').value, fence });
+    toast(`已释放（无合并进度）；下一围栏 ${r.nextFence}，可重新领取`, 'ok');
+    refresh();
+  } catch (e) { errToast(e); }
+}
+
+async function handoverPkg(pid, expectedFence) {
+  const reason = prompt('强制移交理由（已有进度时只能运营移交；证据保留、围栏轮换）', '现场网关通信失联');
+  if (reason === null) return;
+  try {
+    const r = await api(`/api/packages/${encodeURIComponent(pid)}/handover`, {
+      toGatewayId: $('pkgGateway').value, expectedFence, reason,
+    });
+    toast(`已强制移交至 ${r.toGatewayId}，新围栏 <b>${r.fence}</b>（旧回执立即失效）`, 'ok');
+    refresh();
+  } catch (e) { errToast(e); }
+}
+
+// 上传“下一个水位序号”的分段（可被超时重传：同 segmentId + 相同内容）
+async function uploadSeg(pid, fence, outcome) {
+  const p = STATE.packages.find((x) => x.packageId === pid);
+  const seq = p.watermark + 1;
+  const segmentId = `ui-${pid}-${seq}`;
+  const items = [{ seq, outcome }];
+  if (outcome === 'FAILED') items[0].reason = '设备故障';
+  try {
+    const r = await api(`/api/packages/${encodeURIComponent(pid)}/segments`, {
+      gatewayId: $('pkgGateway').value, fence, segmentId, items, manifestHash: p.manifestHash,
+    });
+    toast(r.duplicate
+      ? `相同分段重传（幂等，不重复计数）；检查点 ${r.checkpoint.slice(0, 12)}…`
+      : `已合并序号 ${(r.merged || []).join(',') || '—'}，水位 ${r.watermark}/${p.totalCount}${r.closed ? '，包已完成关闭' : ''}`, 'ok');
+    refresh();
+  } catch (e) { errToast(e); }
+}
+
+// 乱序演示：直接上传当前水位 +2 的序号（应 202 挂起），随后可点正常上传补齐
+async function uploadGapSeg(pid, fence) {
+  const p = STATE.packages.find((x) => x.packageId === pid);
+  const seq = p.watermark + 2;
+  if (seq > p.totalCount) return toast('没有可用的高位序号（包即将完成）', 'err');
+  try {
+    const r = await api(`/api/packages/${encodeURIComponent(pid)}/segments`, {
+      gatewayId: $('pkgGateway').value, fence, segmentId: `ui-${pid}-gap-${seq}`,
+      items: [{ seq, outcome: 'EXECUTED' }], manifestHash: p.manifestHash,
+    });
+    toast(`乱序序号 ${seq} 已挂起；请上传序号 ${p.watermark + 1} 补齐缺口`, 'ok');
+    void r; refresh();
+  } catch (e) { errToast(e); }
+}
+
+async function staleFenceDemo(pid) {
+  try {
+    await api(`/api/packages/${encodeURIComponent(pid)}/segments`, {
+      gatewayId: $('pkgGateway').value, fence: 999, segmentId: `stale-${Date.now()}`,
+      items: [{ seq: 1, outcome: 'FAILED' }],
+    });
+    toast('意外：旧围栏竟然被接受', 'err');
+  } catch (e) { errToast(e); }
+}
+
+async function verifyPkg(pid) {
+  try {
+    const r = await api(`/api/packages/${encodeURIComponent(pid)}/verify`, null, 'GET');
+    toast(r.digestMatches && r.signatureValid
+      ? `验签通过：清单摘要一致，Ed25519 签名有效（${r.keyId}）`
+      : '验签失败：只读包可能被篡改', r.digestMatches && r.signatureValid ? 'ok' : 'err');
+  } catch (e) { errToast(e); }
+}
+
+async function toggleAudit(pid, btn) {
+  const el = $(`aud-${pid}`);
+  if (!el.hidden) { el.hidden = true; btn.textContent = '审计历史'; return; }
+  btn.textContent = '收起历史';
+  try {
+    const a = await api(`/api/packages/${encodeURIComponent(pid)}/audit`, null, 'GET');
+    const typeTxt = {
+      ISSUED: '制包', CLAIMED: '领取', RELEASED: '释放', HANDED_OVER: '强制移交', SEGMENT: '分段回执', CLOSED: '关闭',
+    };
+    el.hidden = false;
+    el.innerHTML = `<div class="muted" style="margin-top:6px">时间线（${a.history.length} 步，链上 ${a.records.length} 条只增记录）：</div>` +
+      a.history.map((h) => {
+        let detail = '';
+        if (h.type === 'CLAIMED') detail = `${h.gatewayId} 取得围栏 ${h.fence}`;
+        if (h.type === 'RELEASED') detail = `${h.gatewayId} 释放围栏 ${h.fence}`;
+        if (h.type === 'HANDED_OVER') detail = `${h.fromGatewayId} → ${h.toGatewayId}，新围栏 ${h.fence}：${esc(h.reason || '')}`;
+        if (h.type === 'SEGMENT') detail = `${h.gatewayId} 围栏${h.fence} 合并[${(h.merged || []).join(',') || '—'}] 水位${h.watermark} cp ${h.checkpoint.slice(0, 12)}…`;
+        if (h.type === 'CLOSED') detail = `关闭原因 ${h.reason}`;
+        return `<div class="muted mono" style="font-size:11.5px">${fmtTs(h.at)} <b>${typeTxt[h.type] || h.type}</b> ${detail} <span class="muted">#${h.recordSeq}</span></div>`;
+      }).join('');
+  } catch (e) { errToast(e); }
+}
+

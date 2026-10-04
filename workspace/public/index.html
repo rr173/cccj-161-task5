@@ -54,6 +54,11 @@
   .tag.PENDING { background:#13315c; color:#8fc2ff; }
   .tag.UPHELD { background:#0f3a2a; color:#5fe3ac; }
   .tag.REJECTED { background:#3f1d1d; color:#ff9d9d; }
+  .tag.OPEN { background:#13315c; color:#8fc2ff; }
+  .tag.CLOSED { background:#26303f; color:#9fb2c8; }
+  .tag.EXECUTED { background:#0f3a2a; color:#5fe3ac; }
+  .tag.SKIPPED { background:#3d2f10; color:#f5c451; }
+  .tag.FAILED { background:#3f1d1d; color:#ff9d9d; }
   .muted { color:var(--muted); font-size:12px; }
   .mono { font-variant-numeric:tabular-nums; font-family:ui-monospace,Menlo,Consolas,monospace; }
   table { width:100%; border-collapse:collapse; font-size:12.5px; }
@@ -204,6 +209,33 @@
   <div class="panel">
     <h2>异议工单（补充材料 / 审核 / 历史）</h2>
     <div id="disputes" class="muted">尚无异议工单。</div>
+  </div>
+</div>
+
+<!-- 现场网关离线作业包 -->
+<div class="wrap" style="grid-template-columns:380px 1fr">
+  <div class="panel">
+    <h2>⑤ 制包（按已发布事件固定版本切设备批次）</h2>
+    <label>已发布（SCHEDULED）事件</label>
+    <select id="pkgEvent"></select>
+
+    <label>设备批次（勾选；不同包不得重复包含同一设备）</label>
+    <div id="pkgDevices" class="card" style="max-height:170px;overflow:auto"></div>
+    <label>有效期（分钟后，留空 = 与事件时窗同寿）</label>
+    <input id="pkgTtl" type="number" min="1" step="15" placeholder="默认至事件结束">
+    <div style="margin-top:10px"><button class="primary" onclick="issuePackage()">生成只读作业包（清单摘要 + Ed25519 验签）</button></div>
+    <div class="muted" style="margin-top:6px">
+      事件被撤销或开始后不再允许领取新包；包过期/撤销/全部完成自动关闭，关闭后设备可重新切包。
+    </div>
+
+    <h3>网关模拟器（领取 / 分段上传 / 释放）</h3>
+    <label>当前模拟网关</label>
+    <select id="pkgGateway"></select>
+    <div class="muted">在右侧包卡片上：领取、上传 EXECUTED/SKIPPED/FAILED 分段、模拟旧围栏、释放。</div>
+  </div>
+  <div class="panel">
+    <h2>离线作业包（围栏 / 检查点 / 移交 / 审计历史）</h2>
+    <div id="packages" class="muted">尚无作业包。先在左侧发布事件并制包。</div>
   </div>
 </div>
 

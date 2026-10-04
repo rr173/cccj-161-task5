@@ -16,8 +16,8 @@ npm start                 # http://localhost:8080
 ```
 
 - 设备执行页面（运营台）：http://localhost:8080/
-- 自动化测试：`npm test`（50 个领域/恢复单测，含 12 个通知投递契约、11 个履约异议契约）
-- 端到端场景：先 `npm start`，再 `npm run test:e2e`（38 项 HTTP 断言）
+- 自动化测试：`npm test`（66 个领域/恢复单测，含 12 个通知投递契约、11 个履约异议契约、16 个离线作业包契约）
+- 端到端场景：先 `npm start`，再 `npm run test:e2e`（69 项 HTTP 断言）
 
 ## 聚合商通知投递模块（独立服务，`notifier/`）
 
@@ -57,6 +57,35 @@ npm run test:notifier     # 24 项真实 HTTP 端到端断言
   由投递服务生成 Ed25519 签名信封并按 `orch:<seq>` 去重。
 - 运营台底部“④ 提起履约异议 / 异议工单”面板支持：提起异议、补充材料、审核通过/驳回、查看历史时间线。
 
+## 现场网关离线作业包（通信不稳定场景）
+
+运营人员按一个**已发布事件的固定版本**为设备批次切出**只读作业包**；现场网关领取后离线执行、分段回传：
+
+- **只读包**：`manifest`（固定事件版本锚点 `eventRefHash` + 设备批次 + 包内连续指令序号 + 有效期）
+  经键名排序规范化后计算 `manifestHash = sha256(canonical)`，并用运营方 **Ed25519 私钥签名**。
+  清单任何字节被改动都会导致摘要不符 / 签名失效（`/api/packages/:id/verify` 可独立复核）。
+- **设备批次互斥**：同一台设备同一时刻只能出现在一个**未关闭包**中（跨包重复 `DEVICE_IN_OTHER_PACKAGE`，
+  批次内重复 `DUPLICATE_DEVICE_IN_BATCH`）；包关闭（过期/撤销/完成）后设备自动释放、可重新切包。
+- **领取窗口**：事件被**撤销或开始后不再允许领取新包**——激活时未领取包以 `EVENT_STARTED` 关闭；
+  已领取的包可继续执行。撤销事件会关闭其全部未关闭包（`EVENT_RECALLED`）。
+- **递增围栏号（fencing token）**：每次领取获得 `fence+1`；同网关超时重试幂等返回原围栏。
+  网关释放（仅首条执行回执前）后可被重新领取；**旧领取者恢复联网后凭旧围栏上传一律 `STALE_FENCE`，
+  绝不覆盖新领取者进度**。
+- **分段回执 + 稳定检查点**：按**包内序号**合并 EXECUTED/SKIPPED/FAILED，高位序号先到则挂起（HTTP 202），
+  缺口补齐自动排水。检查点 = `sha256(canonical({fence, 已合并序号内容, 挂起缺口}))`，
+  台账不变则检查点字节不变。
+- **重传与拒绝语义**：完全相同的分段（包ID+段号+规范化条目，摘要由服务端复算）重传**不重复计数、
+  不追加记录**，原样返回同一检查点；序号内容变化 `SEGMENT_CONFLICT`/`SEQ_CONTENT_CONFLICT`、
+  越界序号 `SEQ_OUT_OF_RANGE`、越界设备 `DEVICE_OUT_OF_SCOPE`、清单摘要不符 `PACKAGE_DIGEST_MISMATCH`、
+  分段摘要不符 `SEGMENT_DIGEST_MISMATCH`、已关闭包 `PACKAGE_CLOSED`（HTTP 410）均明确拒绝。
+- **释放 / 强制移交**：首条执行回执前（无已合并进度）持有网关可自助**释放**，包回到可领取状态；
+  已有进度后只能由运营人员**强制移交**——此前证据（回执/挂起/段台账）全部保留，围栏号轮换，
+  `expectedFence` 用于检测移交竞争（`FENCE_CONFLICT`）。
+- **有效期**：默认与事件时窗同寿，可单独指定；到期由时间推进惰性关闭（`EXPIRED`），之后不可领取/上传。
+- **恢复契约**：领取关系、围栏、检查点、挂起缺口、回执次序全部由链上记录重放重建，重启后不倒退；
+  恢复后用相同段号重传安全幂等，补齐缺口即可继续。
+- 运营台“⑤ 离线作业包”面板支持：制包、领取、执行/跳过/失败分段上传、乱序高位分段、旧围栏演示、
+  释放、强制移交、验签与审计历史时间线。
 
 ## 重启恢复契约（日志损坏 / 断电残尾）
 
@@ -96,6 +125,11 @@ npm run test:notifier     # 24 项真实 HTTP 端到端断言
 11. 底部 **④ 履约异议**：选择聚合商与已封存裁定（编号+指纹），填写事由提交；
     同一请求号重复提交演示幂等，改动正文再提交得到 409；在工单卡片上顺序追加材料、
     审核通过/驳回（终态），展开“历史”查看完整时间线。
+12. 底部 **⑤ 离线作业包**：选一个未开始事件、勾选设备批次制包（验签查看摘要/签名）；
+    选择网关“领取”拿到围栏号；上传执行/跳过/失败分段、用“↕ 乱序高位分段”演示挂起与排水、
+    重复点同一按钮演示超时重传（不重复计数、检查点不变）、“模拟旧围栏回执”看到 `STALE_FENCE`；
+    上传一条进度后“释放”被拒，改用“运营强制移交”（围栏轮换、证据保留）；
+    缩短有效期或撤销事件后观察包关闭；展开“审计历史”查看链上时间线。重启服务后可继续续传。
 
 ## 关键不变量（如何落地需求）
 
@@ -112,6 +146,14 @@ npm run test:notifier     # 24 项真实 HTTP 端到端断言
 | 异议标的锚定 | 异议记录裁定的 `reportId`+`reportHash`；指纹不符/超截止时刻/同标的重复待处理均被拒 |
 | 异议请求号幂等 | `requestId`+正文哈希入链；同号同文返回原结果，同号不同文 409；重启后台账不丢 |
 | 异议材料与审核 | 材料 `materialSeq` 顺序追加；`UPHELD`/`REJECTED` 终态不可再裁定；原裁定内容永不改写 |
+| 离线包只读可验 | 清单规范化哈希 + Ed25519 签名；固定版本锚定事件发布记录链哈希，改动即摘要/签名失效 |
+| 批次设备互斥 | 未关闭包设备索引；跨包重复 `DEVICE_IN_OTHER_PACKAGE`，关闭后释放 |
+| 事件开始/撤销不领新包 | 激活时关闭未领取包（`EVENT_STARTED`）；撤销关闭全部未关闭包（`EVENT_RECALLED`） |
+| 旧围栏回执失效 | 领取/移交分配递增 fence；持有者+围栏双匹配才接受，否则 `STALE_FENCE`，新进度不被覆盖 |
+| 分段幂等与稳定检查点 | segmentId+规范化条目摘要去重，重传不计数不追加；检查点由围栏+台账+挂起规范化哈希 |
+| 乱序分段 | 包内序号水位；高位挂起 202、缺口补齐自动排水；越界/他设备/摘要不符/序号改写均拒绝 |
+| 释放 vs 强制移交 | 无合并进度可自助释放重领；有进度仅运营移交，证据保留 + `expectedFence` 防移交竞争 |
+| 包过期与恢复 | tick 惰性 `EXPIRED` 关闭；领取关系/检查点/挂起/次序全部由链重放，重启不倒退 |
 
 报告裁决等级：`MET`（交付率 ≥ 100%）、`PARTIAL`（≥ 50%）、`MISSED`、`INCONCLUSIVE`（缺口 ≥ 40%）、
 `NO_PARTICIPATION`、`RECALLED`。设备履约：`PERFORMED / UNDERPERFORMED / FAILED / OPT_OUT`。
@@ -136,6 +178,16 @@ npm run test:notifier     # 24 项真实 HTTP 端到端断言
 | GET | `/api/disputes/:id` | 工单详情（材料次序 + 历史时间线） |
 | POST | `/api/disputes/:id/supplements` | 顺序补充材料 `{requestId,aggregatorId,note,kind?,materialSeq?}` |
 | POST | `/api/disputes/:id/resolution` | 审核 `{requestId,outcome:UPHELD\|REJECTED,comment?,resolvedBy?}` |
+| POST | `/api/packages` | 制包 `{eventId,deviceIds:[...],validUntilMs?|validityMinutes?}`（只读包：摘要+Ed25519 签名） |
+| GET | `/api/packages?eventId=&status=` | 作业包列表 |
+| GET | `/api/packages/:id` | 作业包详情（围栏/水位/计数/检查点/挂起缺口/时间线） |
+| GET | `/api/packages/:id/verify` | 独立复核清单摘要 + Ed25519 验签 |
+| GET | `/api/packages/:id/audit` | 审计历史（时间线 + 链上记录 seq/hash 锚点） |
+| POST | `/api/packages/:id/claim` | 网关领取 `{gatewayId}`（幂等重试返回原围栏） |
+| POST | `/api/packages/:id/release` | 首条执行回执前释放 `{gatewayId,fence}` |
+| POST | `/api/packages/:id/handover` | 运营强制移交 `{toGatewayId,expectedFence?,reason?,operator?}`（保留证据+换围栏） |
+| POST | `/api/packages/:id/segments` | 分段回执 `{gatewayId,fence,segmentId,items:[{seq,outcome:EXECUTED\|SKIPPED\|FAILED,reason?,deviceId?}],manifestHash?,segmentHash?}`（挂起 202；相同重传 200 幂等） |
+| GET | `/api/operator-key` | 运营方验签公钥（PEM）与 keyId |
 | GET | `/api/reports/:eventId/versions/:v` | 完整报告（逐区间 + 设备行 + 指纹） |
 | GET | `/api/reports/:eventId/versions/:v/verify` | 独立重算报告指纹 |
 | GET | `/api/chain/verify` | 哈希链 + 全部报告指纹校验 |
@@ -146,13 +198,15 @@ npm run test:notifier     # 24 项真实 HTTP 端到端断言
 事件日志默认落盘到 `data/events.log`（每行一条 JSON，UTF-8 JSONL）：
 
 ```
-SEED_CLOCK / SEED_AGGREGATOR / SEED_METER / SEED_DEVICE / SEED_DAY_READINGS
+SEED_CLOCK / SEED_AGGREGATOR / SEED_METER / SEED_DEVICE / SEED_GATEWAY / SEED_DAY_READINGS
 EVENT_PUBLISHED · BASELINE_FROZEN · EVENT_ACTIVATED · EVENT_CANCELLED · EVENT_CLOSED
 DEVICE_CLAIMED · DEVICE_RELEASED
 DEVICE_RECEIPT · RECEIPT_BUFFERED · RECEIPT_DROPPED
 READINGS_BATCH · DAY_READINGS_LOADED · SIM_METER_OFFLINE · SIM_TICK
 BASELINE_CORRECTED · REPORT_ISSUED
 DISPUTE_FILED · DISPUTE_SUPPLEMENTED · DISPUTE_RESOLVED
+PACKAGE_ISSUED · PACKAGE_CLAIMED · PACKAGE_RELEASED · PACKAGE_HANDED_OVER ·
+PACKAGE_SEGMENT_ACCEPTED · PACKAGE_CLOSED
 ```
 
 每条记录：`{seq,ts,type,payload,prevHash,hash}`，
@@ -167,12 +221,14 @@ src/
   baseline.js     基线算法（近10均值 / 居中8日 / 近5均值，工作日同类日筛选）
   adjudication.js 削减报告纯函数（区间能量、裁决等级、内容指纹）
   store.js        只增日志 + SHA-256 哈希链（重启恢复：残尾归档续链 / 损坏只读隔离）
-  seed.js         确定性种子（2 聚合商 / 3 计量点 / 5 设备 / 21 天 15 分钟曲线，含缺失日）
+  offline.js      离线作业包纯函数（清单/摘要/Ed25519 验签/分段合并/稳定检查点）
+  seed.js         确定性种子（2 聚合商 / 3 计量点 / 5 设备 / 3 现场网关 / 21 天 15 分钟曲线，含缺失日）
   clock.js        仿真时钟
   util.js         时间区间、规范化 JSON、哈希
-public/           运营台（index.html + app.js，含隔离/残尾恢复横幅、履约异议面板）
+public/           运营台（index.html + app.js，含隔离/残尾恢复横幅、履约异议面板、离线作业包面板）
 test/kernel.test.js   14 个领域单测（node:test）
 test/dispute.test.js  11 个履约异议单测（受理/幂等/材料顺序/终态/重启/投递映射）
+test/offline-package.test.js 16 个离线作业包单测（制包/围栏/重传/乱序/释放/移交/过期/撤销/重启恢复）
 test/recovery.test.js 13 个恢复契约单测（残尾/篡改/断链/503 边界/重启续链，含真实 HTTP）
-scripts/e2e.mjs       38 项 HTTP 端到端断言
+scripts/e2e.mjs       69 项 HTTP 端到端断言（含场景 J 离线作业包 31 项）
 ```

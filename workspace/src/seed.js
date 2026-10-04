@@ -89,6 +89,14 @@ export function seed(store, now = BASE_NOW) {
   ];
   devices.forEach((d) => store.append('SEED_DEVICE', d, now));
 
+  // 现场网关（离线作业包的领取/执行单元；通信不稳定，作业包带围栏号防旧领取者覆盖）
+  const gateways = [
+    { id: 'GW-1', name: '浦东#12 现场网关' },
+    { id: 'GW-2', name: '松江#07 现场网关' },
+    { id: 'GW-3', name: '嘉定#21 现场网关' },
+  ];
+  gateways.forEach((g) => store.append('SEED_GATEWAY', g, now));
+
   // 21 个历史日；故意制造缺口：
   // - MP-1 缺 D-4（演示迟到历史数据 -> 基线订正版 v2）
   // - MP-2 缺 D-2
@@ -101,7 +109,7 @@ export function seed(store, now = BASE_NOW) {
     }
   });
 
-  return { aggregators, meters, devices };
+  return { aggregators, meters, devices, gateways };
 }
 
 export { meterProfile, mulberry32, strSeed };
