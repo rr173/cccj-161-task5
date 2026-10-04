@@ -5,6 +5,8 @@ import { computeBaseline } from './baseline.js';
 import { buildReport } from './adjudication.js';
 import { seed, BASE_NOW, meterProfile, mulberry32, strSeed, dayValuesForKey } from './seed.js';
 import { EventStore, LogQuarantineError } from './store.js';
+import { PackageRegistry } from './packages.js';
+import { PackageKeyStore } from './package-crypto.js';
 import {
   INTERVAL_MS,
   INTERVALS_PER_DAY,
@@ -46,9 +48,18 @@ function simIntervalActual(meterIdx, ts, totalShedKw) {
 }
 
 export class Kernel {
-  constructor(store, { boot = true } = {}) {
+  constructor(store, { boot = true, packageKeys = null } = {}) {
     this.store = store;
     this.clock = new Clock(BASE_NOW);
+    // 离线作业包签发密钥（私钥/主密钥）：默认纯内存；server 注入文件型 sidecar
+    this.packageKeys = packageKeys || new PackageKeyStore(null);
+    this.packages = new PackageRegistry({
+      store,
+      keys: this.packageKeys,
+      clockNow: () => this.now(),
+      getEvent: (eventId) => this.s?.events.get(eventId),
+      getDevice: (deviceId) => this.s?.devices.get(deviceId),
+    });
     if (boot) this.bootstrap();
   }
 
@@ -64,13 +75,26 @@ export class Kernel {
       seed(this.store, BASE_NOW);
     }
     this.replay();
+    this.ensurePackageKey();
   }
 
   reset() {
     this.store.truncate();
+    this.packageKeys.reset();
     seed(this.store, BASE_NOW);
     this.clock = new Clock(BASE_NOW);
     this.replay();
+    this.ensurePackageKey();
+  }
+
+  // 离线作业包签发密钥：链上无 PACKAGE_KEY_PUBLISHED 时生成并发布（只含公钥）；
+  // 重放后 currentKeyId 已由链上记录重建，幂等不重复生成。
+  ensurePackageKey() {
+    if (!this.store.writable) return;
+    if (this.packageKeys.currentKeyId) return;
+    const pub = this.packageKeys.rotate(iso(this.now()));
+    this.store.append('PACKAGE_KEY_PUBLISHED', pub, this.now());
+    this.apply(this.store.all().at(-1));
   }
 
   replay() {
@@ -95,6 +119,15 @@ export class Kernel {
       requests: new Map(), // requestId -> {op, bodyHash, disputeId, materialSeq?}（客户请求号幂等台账）
       genCursor: floorInterval(BASE_NOW),
     };
+    // 离线作业包投影随链重放：领取关系、围栏号、检查点、回执次序全部从记录重建，重启不倒退
+    this.packages.bind({
+      store: this.store,
+      keys: this.packageKeys,
+      clockNow: () => this.now(),
+      getEvent: (eventId) => this.s.events.get(eventId),
+      getDevice: (deviceId) => this.s.devices.get(deviceId),
+    });
+    this.packages.reset();
     this.clock = new Clock(BASE_NOW);
     for (const rec of this.store.all()) this.apply(rec);
   }
@@ -293,6 +326,17 @@ export class Kernel {
         s.requests.set(p.requestId, { op: rec.type, bodyHash: p.bodyHash, disputeId: p.disputeId });
         break;
       }
+      case 'PACKAGE_KEY_PUBLISHED':
+      case 'PACKAGE_ISSUED':
+      case 'PACKAGE_CLAIMED':
+      case 'PACKAGE_RELEASED':
+      case 'PACKAGE_HANDOVER':
+      case 'PACKAGE_SEGMENT_ACCEPTED':
+      case 'PACKAGE_REJECTED':
+      case 'PACKAGE_CLOSED':
+      case 'PACKAGE_EXPIRED':
+        this.packages.apply(rec);
+        break;
       default:
         break;
     }
@@ -346,6 +390,16 @@ export class Kernel {
         return this.supplementDispute(cmd, now);
       case 'RESOLVE_DISPUTE':
         return this.resolveDispute(cmd, now);
+      case 'ISSUE_PACKAGE':
+        return this.packages.issuePackage(cmd, now);
+      case 'CLAIM_PACKAGE':
+        return this.packages.claimPackage(cmd, now);
+      case 'RELEASE_PACKAGE':
+        return this.packages.releasePackage(cmd, now);
+      case 'HANDOVER_PACKAGE':
+        return this.packages.handoverPackage(cmd, now);
+      case 'UPLOAD_PACKAGE_SEGMENT':
+        return this.packages.uploadSegment(cmd, now);
       case 'TICK':
         return this.tick(cmd.minutes ?? 15, now);
       case 'RESET':
@@ -436,6 +490,9 @@ export class Kernel {
       released.push(deviceId);
     }
 
+    // 撤销即作废该事件下全部离线作业包：强制关闭（证据保留），网关再上传得到 PACKAGE_CLOSED
+    const packagesClosed = this.packages.closeForEvent(ev.id, 'EVENT_RECALLED', now);
+
     let report = null;
     if (ev.startMs <= now) {
       // 时窗已开始：确保基线已冻结（取消与开始并发时），出具撤销版原始裁决
@@ -453,7 +510,7 @@ export class Kernel {
         report = this.issueReport(ev, { kind: 'ORIGINAL', reason: 'EVENT_RECALLED', cutoffTs: now });
       }
     }
-    return { eventId: ev.id, status: 'RECALLED', released, report };
+    return { eventId: ev.id, status: 'RECALLED', released, packagesClosed, report };
   }
 
   claimDevice(cmd, now) {
@@ -1045,10 +1102,12 @@ export class Kernel {
     this.apply(this.store.all().at(-1));
 
     const frozen = this.freezeDue(to);
+    // 事件开始时刻默认即包有效期：开始后未领取（OPEN）的包确定过期，不再允许领取
+    const packagesExpired = this.packages.expireDue(to);
     const generated = this.#generateSimReadings(to);
     const closed = this.closeDue(to);
 
-    return { now: to, iso: iso(to), frozen, closed, generatedIntervals: generated };
+    return { now: to, iso: iso(to), frozen, closed, generatedIntervals: generated, packagesExpired };
   }
 
   #generateSimReadings(now) {
@@ -1157,6 +1216,24 @@ export class Kernel {
       ...ev,
       startIso: iso(ev.startMs),
       endIso: iso(ev.endMs),
+      offlinePackages: this.packages.list()
+        .filter((pk) => pk.eventId === id)
+        .map((pk) => ({
+          packageId: pk.packageId,
+          status: pk.status,
+          gatewayId: pk.gatewayId,
+          fence: pk.fence,
+          deviceCount: pk.deviceCount,
+          deviceIds: pk.deviceIds,
+          merged: pk.checkpoint.counts.merged,
+          executed: pk.checkpoint.counts.executed,
+          skipped: pk.checkpoint.counts.skipped,
+          failed: pk.checkpoint.counts.failed,
+          validUntil: pk.validUntil,
+          validUntilIso: pk.validUntilIso,
+          manifestHash: pk.manifestHash,
+          signature: pk.signature,
+        })),
       baselineVersions: baselines.map((b) => ({
         version: b.version, frozenAt: b.frozenAt || b.at, reason: b.reason || 'FREEZE', days: b.days,
       })),
@@ -1198,6 +1275,10 @@ export class Kernel {
       }),
       events: [...this.s.events.values()].map((e) => this.eventView(e.id)),
       disputes: this.listDisputes(),
+      packages: this.packages.list(),
+      packageKeys: this.store.all()
+        .filter((r) => r.type === 'PACKAGE_KEY_PUBLISHED')
+        .map((r) => ({ keyId: r.payload.keyId, publicKeyPem: r.payload.publicKeyPem, rotatedAt: r.payload.rotatedAt })),
       chain: this.store.verify(),
     };
   }

@@ -54,6 +54,14 @@
   .tag.PENDING { background:#13315c; color:#8fc2ff; }
   .tag.UPHELD { background:#0f3a2a; color:#5fe3ac; }
   .tag.REJECTED { background:#3f1d1d; color:#ff9d9d; }
+  .tag.OPEN { background:#13315c; color:#8fc2ff; }
+  .tag.CLAIMED { background:#0f3a2a; color:#5fe3ac; }
+  .tag.RELEASED { background:#3d2f10; color:#f5c451; }
+  .tag.EXPIRED { background:#3f1d1d; color:#ff9d9d; }
+  .tag.EXECUTED { background:#0f3a2a; color:#5fe3ac; }
+  .tag.SKIPPED { background:#3d2f10; color:#f5c451; }
+  .tag.FAILED { background:#3f1d1d; color:#ff9d9d; }
+  .fence { font-family:ui-monospace,Menlo,Consolas,monospace; color:var(--violet); font-weight:700; }
   .muted { color:var(--muted); font-size:12px; }
   .mono { font-variant-numeric:tabular-nums; font-family:ui-monospace,Menlo,Consolas,monospace; }
   table { width:100%; border-collapse:collapse; font-size:12.5px; }
@@ -176,6 +184,67 @@
       <pre class="log" id="miniLog">（点击“校验/日志”加载）</pre>
       <button class="ghost" onclick="loadLog()">刷新裁决日志</button>
     </div>
+  </div>
+</div>
+
+<!-- 离线作业包：制包 / 领取 / 分段上传 / 释放或移交 / 审计 -->
+<div class="wrap" style="grid-template-columns:380px 1fr 400px">
+  <div class="panel">
+    <h2>⑤ 制包（运营按已发布事件切设备批次）</h2>
+    <label>事件（只能选择 SCHEDULED 已发布事件）</label>
+    <select id="pkgEvent"></select>
+    <label>设备批次（同一事件下设备不可跨包重复）</label>
+    <div id="pkgDevices" class="card" style="max-height:170px;overflow:auto"></div>
+    <label>有效期（分钟后，留空=事件开始时刻）</label>
+    <input id="pkgValid" type="number" placeholder="默认到事件开始" min="1">
+    <div style="margin-top:10px"><button class="primary" onclick="issuePackage()">生成只读作业包（清单+指令+有效期+签名）</button></div>
+    <div class="muted" style="margin-top:6px">
+      事件撤销或开始后不可再制包；包锚定事件发布版本（编号+哈希），内容只读并由运营 Ed25519 密钥签名。
+    </div>
+  </div>
+
+  <div class="panel">
+    <h2>作业包与领取关系（围栏号 / 检查点）</h2>
+    <div id="pkgList" class="muted">尚无作业包。</div>
+  </div>
+
+  <div class="panel">
+    <h2>网关控制台（领取 / 分段上传 / 释放 / 移交）</h2>
+    <label>当前作业包</label>
+    <select id="gwPkg"></select>
+    <label>网关身份</label>
+    <select id="gwId">
+      <option value="GW-A">GW-A · 现场甲</option>
+      <option value="GW-B">GW-B · 现场乙</option>
+      <option value="GW-C">GW-C · 抢修组</option>
+    </select>
+    <div class="grid2" style="margin-top:8px">
+      <button class="good" onclick="gwClaim()">领取（获得围栏号+上传密钥）</button>
+      <button class="warn" onclick="gwRelease()">零进度释放</button>
+    </div>
+    <h3>分段上传（执行 / 跳过 / 失败）</h3>
+    <div class="muted">逐序号填写；可先传高序号演示乱序，重发同段演示超时幂等。</div>
+    <table>
+      <thead><tr><th>序号</th><th>设备</th><th>结果</th><th>说明</th></tr></thead>
+      <tbody id="gwRows"></tbody>
+    </table>
+    <label>分段号 segSeq（同围栏内重传必须与内容一致）</label>
+    <input id="gwSegSeq" type="number" value="1" min="1">
+    <div class="row" style="margin-top:6px">
+      <button class="primary" onclick="gwUpload()">计算 HMAC 摘要并上传</button>
+      <button class="ghost" onclick="gwTamper()">篡改摘要演示</button>
+    </div>
+    <div style="margin-top:8px">
+      <button class="bad" onclick="gwHandover()">运营强制移交到所选网关（保留证据+轮换围栏）</button>
+    </div>
+    <div id="gwCheckpoint" class="mono muted" style="margin-top:8px"></div>
+  </div>
+</div>
+
+<div class="wrap" style="grid-template-columns:1fr">
+  <div class="panel">
+    <h2>作业包审计历史（只增记录：领取/拒绝/合并/释放/移交/关闭/过期）</h2>
+    <div id="pkgAudit" class="muted">在上方选择作业包查看完整时间线。</div>
   </div>
 </div>
 

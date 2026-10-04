@@ -12,6 +12,8 @@ import { fileURLToPath } from 'node:url';
 import { Kernel } from '../src/kernel.js';
 import { BASE_NOW } from '../src/seed.js';
 import { EventStore, LogQuarantineError } from '../src/store.js';
+import { PackageKeyStore, segmentDigest } from '../src/package-crypto.js';
+import { canonicalJSON } from '../src/util.js';
 
 const I = 15 * 60 * 1000;
 const START = Date.UTC(2026, 8, 16, 2, 0, 0);
@@ -348,6 +350,9 @@ test('HTTP 边界：隔离时 GET 只读接口 200 且含首个损坏位置，�
       ['/api/readings', { items: [] }],
       ['/api/claims', { eventId: 'X', deviceId: 'DEV-1', aggregatorId: 'AGG-A' }],
       ['/api/receipts', { eventId: 'X', deviceId: 'DEV-1', status: 'ACCEPTED' }],
+      ['/api/packages', { eventId: 'X', deviceIds: ['DEV-1'] }],
+      ['/api/packages/X/claim', { gatewayId: 'GW-A' }],
+      ['/api/packages/X/segments', { fence: 1, segSeq: 1, items: [], digest: 'x' }],
       ['/api/sim/reset', {}],
     ]) {
       const res = await fetch(base + p, {
@@ -414,3 +419,62 @@ test('HTTP 边界：残尾恢复后服务正常启动，写入 2xx，重启后�
   assert.equal(firstNew.prevHash, s1.tipHash);
   assert.equal(r.store.verify().ok, true);
 });
+
+test('离线作业包：断电残尾/正常重启后领取关系、围栏、检查点、回执次序由链重建', async () => {
+  const { file } = await tmpLog();
+  const keysFile = path.join(path.dirname(file), 'package-keys.json');
+
+  const st = new EventStore(file);
+  const keys = new PackageKeyStore(keysFile);
+  const k = new Kernel(st, { packageKeys: keys });
+  const evId = k.dispatch({
+    type: 'PUBLISH_EVENT', meterId: 'MP-1', targetKw: 40,
+    startMs: START, endMs: END, algorithm: 'MID_8_OF_10',
+  }).event.id;
+  const pkgId = k.dispatch({ type: 'ISSUE_PACKAGE', eventId: evId, deviceIds: ['DEV-1', 'DEV-2'] }).package.packageId;
+  const c = k.dispatch({ type: 'CLAIM_PACKAGE', packageId: pkgId, gatewayId: 'GW-A' });
+  const secretFence1 = c.upload.secret;
+  const dg = segmentDigest(secretFence1, canonicalJSON({
+    packageId: pkgId, fence: 1, segSeq: 1,
+    items: [{ seq: 2, deviceId: 'DEV-2', outcome: 'SKIPPED', detail: null }],
+  }));
+  k.dispatch({
+    type: 'UPLOAD_PACKAGE_SEGMENT', packageId: pkgId, fence: 1, segSeq: 1,
+    gatewayId: 'GW-A', items: [{ seq: 2, deviceId: 'DEV-2', outcome: 'SKIPPED' }], digest: dg,
+  });
+  const before = k.packages.view(pkgId);
+  const tokenBefore = before.checkpoint.checkpointToken;
+
+  // 正常重启（同一日志 + 同一 sidecar）
+  const { kernel: k2 } = await reloadWithKeys(file, keysFile);
+  const after = k2.packages.view(pkgId);
+  assert.equal(after.gatewayId, 'GW-A');
+  assert.equal(after.fence, 1);
+  assert.equal(after.status, 'CLAIMED');
+  assert.equal(after.checkpoint.checkpointToken, tokenBefore, '检查点令牌重建一致');
+  assert.deepEqual(after.checkpoint.appliedSeqs, [2]);
+  assert.equal(after.history[0].type, 'ISSUED');
+  // 主密钥随 sidecar 持久化，围栏 1 的上传密钥逐字节一致 -> 旧网关可继续上传
+  assert.equal(
+    k2.packageKeys.uploadSecretFor(after.keyId, pkgId, 1),
+    secretFence1,
+  );
+  const dg2 = segmentDigest(secretFence1, canonicalJSON({
+    packageId: pkgId, fence: 1, segSeq: 2,
+    items: [{ seq: 1, deviceId: 'DEV-1', outcome: 'EXECUTED', detail: null }],
+  }));
+  const fin = k2.dispatch({
+    type: 'UPLOAD_PACKAGE_SEGMENT', packageId: pkgId, fence: 1, segSeq: 2,
+    gatewayId: 'GW-A', items: [{ seq: 1, deviceId: 'DEV-1', outcome: 'EXECUTED' }], digest: dg2,
+  });
+  assert.equal(fin.autoClosed, true);
+});
+
+async function reloadWithKeys(file, keysFile) {
+  const store = new EventStore(file);
+  await store.load();
+  const keys = new PackageKeyStore(keysFile);
+  const kernel = new Kernel(store, { boot: false, packageKeys: keys });
+  kernel.replay();
+  return { store, kernel, keys };
+}

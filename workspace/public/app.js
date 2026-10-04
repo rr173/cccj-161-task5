@@ -50,6 +50,10 @@ function render() {
   renderChain();
   renderDisputeForm();
   renderDisputes();
+  renderPackageForm();
+  renderPackageList();
+  renderGateway();
+  renderPackageAudit();
   if (!$('evMeter').dataset.filled) {
     $('evMeter').innerHTML = STATE.meters.map((m) => `<option value="${m.id}">${m.id} · ${m.name}</option>`).join('');
     $('evMeter').dataset.filled = '1';
@@ -551,6 +555,272 @@ async function resolveDispute(disputeId, outcome) {
     toast(`异议 ${disputeId} 已${outcome === 'UPHELD' ? '通过' : '驳回'}（终态，不可再裁定；原裁定内容不变）`, 'ok');
     refresh();
   } catch (e) { errToast(e); }
+}
+
+// ---------- 离线作业包 ----------
+
+const pkgSelectedDevices = new Set();
+
+function packageStatusTag(s) {
+  return `<span class="tag ${s}">${s}</span>`;
+}
+
+function renderPackageForm() {
+  const sel = $('pkgEvent');
+  const schedulable = STATE.events.filter((e) => e.status === 'SCHEDULED');
+  const prev = sel.value;
+  sel.innerHTML = schedulable.length
+    ? schedulable.map((e) => `<option value="${e.id}">${e.id} · ${e.meterId} · 开始 ${fmtTs(e.startMs)}</option>`).join('')
+    : '<option value="">（没有可制包的 SCHEDULED 事件）</option>';
+  if (schedulable.some((e) => e.id === prev)) sel.value = prev;
+
+  const ev = STATE.events.find((e) => e.id === sel.value);
+  if (!ev) { $('pkgDevices').innerHTML = '<span class="muted">—</span>'; return; }
+  const bound = new Set((ev.offlinePackages || []).flatMap((p) => p.deviceIds));
+  $('pkgDevices').innerHTML = STATE.devices
+    .filter((d) => d.meterId === ev.meterId)
+    .map((d) => {
+      const used = bound.has(d.id);
+      const checked = pkgSelectedDevices.has(d.id) && !used;
+      return `<label style="display:flex;align-items:center;gap:7px;margin:3px 0;color:${used ? 'var(--muted)' : 'var(--txt)'}">
+        <input type="checkbox" style="width:auto" ${checked ? 'checked' : ''} ${used ? 'disabled' : ''}
+          onchange="togglePkgDevice('${d.id}', this.checked)">
+        <b>${d.id}</b> <span class="muted">${d.name} · ≤${d.maxKw}kW</span>
+        ${used ? '<span class="pill">已在其他包</span>' : ''}
+      </label>`;
+    }).join('');
+}
+
+function togglePkgDevice(id, on) {
+  if (on) pkgSelectedDevices.add(id); else pkgSelectedDevices.delete(id);
+}
+
+function renderPackageList() {
+  const list = [...(STATE.packages || [])].sort((a, b) => b.issuedAt - a.issuedAt);
+  if (!list.length) { $('pkgList').className = 'muted'; $('pkgList').textContent = '尚无作业包。'; fillPkgSelect(); return; }
+  $('pkgList').className = '';
+  $('pkgList').innerHTML = list.map((p) => {
+    const c = p.checkpoint.counts;
+    const pct = Math.round((c.merged / c.total) * 100);
+    return `<div class="card ${p.status === 'CLAIMED' ? 'active' : ''}">
+      <div class="row" style="justify-content:space-between">
+        <b>${p.packageId}</b> ${packageStatusTag(p.status)}
+      </div>
+      <div class="muted mono" style="margin:3px 0">
+        事件 ${p.eventId} @v${p.eventVersion}（锚 #${p.anchorSeq}）<br>
+        网关 ${p.gatewayId ? `<b>${p.gatewayId}</b>` : '—'} · 围栏 <span class="fence">f${p.fence}</span> · 领取次数 ${p.claimCount}<br>
+        有效期至 ${p.validUntilIso.replace('T', ' ').slice(0, 16)}${p.closeReason ? ` · 关闭原因 ${p.closeReason}` : ''}
+      </div>
+      <div>${c.executed} 执行 · ${c.skipped} 跳过 · ${c.failed} 失败 · 剩余 ${c.remaining}/${c.total}</div>
+      <div class="bar"><i style="width:${pct}%"></i></div>
+      <div class="muted mono" style="margin-top:3px;font-size:10.5px">清单 ${p.manifestHash.slice(0, 16)}…</div>
+      <div class="btns" style="margin-top:6px">
+        <button class="ghost" onclick="selectPkg('${p.packageId}')">在网关台打开</button>
+        <button class="ghost" onclick="verifyPkg('${p.packageId}')">验签</button>
+        <button class="ghost" onclick="showManifest('${p.packageId}')">只读包</button>
+      </div>
+    </div>`;
+  }).join('');
+  fillPkgSelect();
+}
+
+function fillPkgSelect() {
+  const sel = $('gwPkg');
+  const prev = sel.value;
+  const list = [...(STATE.packages || [])].sort((a, b) => b.issuedAt - a.issuedAt);
+  sel.innerHTML = list.map((p) => `<option value="${p.packageId}">${p.packageId} · ${p.status} · f${p.fence} · ${p.gatewayId || '无网关'}</option>`).join('');
+  if (list.some((p) => p.packageId === prev)) sel.value = prev;
+  renderGatewayRows();
+}
+
+function selectedPkg() {
+  return (STATE.packages || []).find((p) => p.packageId === $('gwPkg').value) || null;
+}
+
+function selectPkg(id) {
+  $('gwPkg').value = id;
+  renderGatewayRows();
+  renderPackageAudit();
+  toast(`已在网关台打开 <b>${id}</b>`, 'ok');
+}
+
+function renderGatewayRows() {
+  const p = selectedPkg();
+  const tb = $('gwRows');
+  if (!p) { tb.innerHTML = ''; $('gwCheckpoint').textContent = ''; return; }
+  const receipts = new Map(p.receipts.map((r) => [r.seq, r]));
+  tb.innerHTML = p.instructions.map((ins) => {
+    const r = receipts.get(ins.seq);
+    return `<tr>
+      <td class="mono">${ins.seq}</td>
+      <td>${ins.deviceId}<div class="muted">${ins.targetKw}kW</div></td>
+      <td><select id="oc-${ins.seq}" ${r ? 'disabled' : ''}>
+        <option value="EXECUTED"${r?.outcome === 'EXECUTED' ? ' selected' : ''}>执行 EXECUTED</option>
+        <option value="SKIPPED"${r?.outcome === 'SKIPPED' ? ' selected' : ''}>跳过 SKIPPED</option>
+        <option value="FAILED"${r?.outcome === 'FAILED' ? ' selected' : ''}>失败 FAILED</option>
+      </select></td>
+      <td><input id="dt-${ins.seq}" style="width:88px" value="${r ? esc(r.detail ?? '') : ''}" ${r ? 'disabled' : ''}></td>
+    </tr>`;
+  }).join('');
+  const cp = p.checkpoint;
+  $('gwCheckpoint').innerHTML = `围栏 f${cp.fence} · 水位 ${cp.watermark}/${cp.counts.total} · ` +
+    `合并 ${cp.counts.merged}（执${cp.counts.executed}/跳${cp.counts.skipped}/败${cp.counts.failed}）<br>` +
+    `检查点令牌 <span style="font-size:10px">${cp.checkpointToken.slice(0, 24)}…</span>`;
+}
+
+function renderGateway() {
+  renderGatewayRows();
+}
+
+function segmentItemsFromRows() {
+  const p = selectedPkg();
+  if (!p) return [];
+  return p.instructions.map((ins) => ({
+    seq: ins.seq,
+    deviceId: ins.deviceId,
+    outcome: $(`oc-${ins.seq}`).value,
+    detail: $(`dt-${ins.seq}`).value || null,
+  }));
+}
+
+async function issuePackage() {
+  const eventId = $('pkgEvent').value;
+  const deviceIds = [...pkgSelectedDevices];
+  if (!eventId) return toast('没有可制包的事件', 'err');
+  if (!deviceIds.length) return toast('请勾选至少一台设备', 'err');
+  const body = { eventId, deviceIds };
+  if ($('pkgValid').value) body.validForMinutes = Number($('pkgValid').value);
+  try {
+    const r = await api('/api/packages', body);
+    pkgSelectedDevices.clear();
+    toast(`作业包 <b>${r.package.packageId}</b> 已生成并签名（${r.package.deviceCount} 台，有效期至 ${r.package.validUntilIso.slice(11, 16)}）`, 'ok');
+    $('gwPkg').value = r.package.packageId;
+    refresh();
+  } catch (e) { errToast(e); }
+}
+
+async function gwClaim() {
+  const p = selectedPkg();
+  if (!p) return;
+  try {
+    const r = await api(`/api/packages/${p.packageId}/claim`, { gatewayId: $('gwId').value });
+    toast(`领取成功，围栏 <b>f${r.fence}</b>${r.idempotent ? '（幂等，未轮换）' : '（新围栏）'}，已获得 HMAC 上传密钥`, 'ok');
+    window.__gwSecret = r.upload.secret;
+    window.__gwFence = r.fence;
+    $('gwSegSeq').value = 1;
+    refresh();
+  } catch (e) { errToast(e); }
+}
+
+async function gwRelease() {
+  const p = selectedPkg();
+  if (!p) return;
+  try {
+    await api(`/api/packages/${p.packageId}/release`, { gatewayId: $('gwId').value, reason: '网关台释放' });
+    toast('作业包已释放（零进度），可由其他网关重新领取', 'ok');
+    window.__gwSecret = null;
+    refresh();
+  } catch (e) { errToast(e); }
+}
+
+async function gwHandover() {
+  const p = selectedPkg();
+  if (!p) return;
+  if (!confirm(`强制移交给 ${$('gwId').value}？此前回执证据保留，围栏号将从 f${p.fence} 轮换到 f${p.fence + 1}。`)) return;
+  try {
+    const r = await api(`/api/packages/${p.packageId}/handover`, {
+      toGatewayId: $('gwId').value, reason: '运营台强制移交', by: '运营方',
+    });
+    window.__gwSecret = r.upload.secret;
+    window.__gwFence = r.fence;
+    toast(`已移交 ${r.handover.toGatewayId}：<b>f${r.handover.oldFence} → f${r.handover.newFence}</b>，保留证据 ${r.handover.preservedReceipts} 条`, 'ok');
+    refresh();
+  } catch (e) { errToast(e); }
+}
+
+async function gwUpload(tamper = false) {
+  const p = selectedPkg();
+  if (!p) return;
+  const segSeq = Number($('gwSegSeq').value);
+  const items = segmentItemsFromRows();
+  if (!items.length) return;
+  try {
+    let secret = window.__gwSecret;
+    if (window.__gwFence !== p.fence || !secret) {
+      const c = await api(`/api/packages/${p.packageId}/claim`, { gatewayId: $('gwId').value });
+      if (c.gatewayId !== $('gwId').value) {
+        throw Object.assign(new Error(`该包当前属于网关 ${c.gatewayId}，请切换网关身份或由运营强制移交`), { code: 'PACKAGE_ALREADY_CLAIMED' });
+      }
+      secret = c.upload.secret;
+      window.__gwSecret = secret;
+      window.__gwFence = c.fence;
+    }
+    const dg = await api('/api/packages/digest', {
+      uploadSecret: secret, packageId: p.packageId, fence: p.fence, segSeq, items,
+    });
+    let digest = dg.digest;
+    if (tamper) digest = digest.slice(0, -1) + (digest.endsWith('0') ? '1' : '0');
+    const r = await api(`/api/packages/${p.packageId}/segments`, {
+      fence: p.fence, segSeq, gatewayId: $('gwId').value, items, digest,
+    });
+    if (r.duplicate) toast(`分段完全相同（超时重传）：幂等不计数，检查点 wm ${r.checkpoint.watermark}`, '');
+    else toast(`已合并 ${r.merged?.length ?? 0} 条，水位 ${r.checkpoint.watermark}/${r.checkpoint.counts.total}${r.autoClosed ? '，包已关闭' : ''}`, 'ok');
+    refresh();
+  } catch (e) { errToast(e); }
+}
+
+async function verifyPkg(id) {
+  const r = await api(`/api/packages/${id}/verify`, null, 'GET');
+  const ok = r.signatureValid && r.manifestHashMatches && r.entriesHashMatches;
+  toast(`作业包 <b>${id}</b> 验签：${ok ? '通过 ✔（Ed25519 + 清单/条目摘要一致）' : '失败'}<br>
+    <span class="mono" style="font-size:10px">${r.recomputedManifestHash.slice(0, 28)}…</span>`, ok ? 'ok' : 'err');
+}
+
+async function showManifest(id) {
+  const detail = await api(`/api/packages/${id}`, null, 'GET');
+  // 完整只读包（含签名）在链上 PACKAGE_ISSUED 记录；从日志接口取
+  const log = await api('/api/log?limit=2000', null, 'GET');
+  const issued = log.records.find((r) => r.type === 'PACKAGE_ISSUED' && r.payload.packageId === id)?.payload;
+  const w = window.open('', '_blank');
+  w.document.write('<pre style="font:12px ui-monospace;white-space:pre-wrap;background:#0e1420;color:#cfe1f8;padding:20px">' +
+    esc(JSON.stringify({
+      package: issued ? {
+        format: issued.manifest.format,
+        packageId: issued.packageId,
+        eventId: issued.eventId,
+        eventVersion: issued.eventVersion,
+        anchor: { seq: issued.anchorSeq, hash: issued.anchorHash },
+        keyId: issued.keyId,
+        manifestHash: issued.manifestHash,
+        entriesHash: issued.entriesHash,
+        validUntilIso: detail.validUntilIso,
+        issuedAtIso: detail.issuedAtIso,
+        manifest: issued.manifest,
+        instructions: issued.instructions,
+        signature: issued.signature,
+      } : { detail },
+      verifyHint: 'Ed25519: verify(keyId 公钥, canonicalJSON(manifest), signature)',
+    }, null, 2)) + '</pre>');
+}
+
+function renderPackageAudit() {
+  const el = $('pkgAudit');
+  const p = selectedPkg();
+  if (!p) { el.className = 'muted'; el.textContent = '在上方选择作业包查看完整时间线。'; return; }
+  el.className = '';
+  const rows = p.history.map((h) => {
+    let msg = h.type;
+    if (h.type === 'CLAIMED') msg = `领取 @${h.gatewayId}（fence f${h.fence}）`;
+    if (h.type === 'RELEASED') msg = `释放 @${h.gatewayId}（fence f${h.fence}）${h.reason ? '· ' + h.reason : ''}`;
+    if (h.type === 'HANDOVER') msg = `强制移交 ${h.fromGatewayId} → ${h.toGatewayId}（f${h.oldFence} → f${h.newFence}）· ${h.reason}`;
+    if (h.type === 'SEGMENT_ACCEPTED') msg = `分段 #${h.segSeq} @fence f${h.fence} 合并 ${h.merged} 条，累计 ${h.mergedCount}`;
+    if (h.type === 'REJECTED') msg = `<b style="color:var(--bad)">拒绝 ${h.code}</b> · ${esc(h.reason || '')}（seg ${h.segSeq ?? '-'} fence ${h.fence ?? '-'} @${h.gatewayId ?? '-'}）`;
+    if (h.type === 'CLOSED') msg = `关闭（${h.reason}）`;
+    if (h.type === 'EXPIRED') msg = '过期确定';
+    return `<div class="muted mono">${fmtTs(h.at)} ${msg} <span class="muted">— 记录#${h.recordSeq}</span></div>`;
+  }).join('');
+  el.innerHTML = `<div class="row" style="justify-content:space-between;margin-bottom:6px">
+      <b>${p.packageId}</b> ${packageStatusTag(p.status)} <span class="muted">事件 ${p.eventId}</span></div>${rows}`;
 }
 
 refresh();

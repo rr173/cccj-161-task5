@@ -5,19 +5,24 @@ import { fileURLToPath } from 'node:url';
 import { dirname, join, extname, normalize } from 'node:path';
 import { Kernel } from './kernel.js';
 import { EventStore } from './store.js';
-import { sha256Hex, canonicalJSON } from './util.js';
+import { PackageKeyStore, segmentDigest as hmacSegmentDigest } from './package-crypto.js';
+import { canonicalJSON as pkgCanonicalJSON, sha256Hex, canonicalJSON } from './util.js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const PUBLIC_DIR = join(__dirname, '..', 'public');
 const LOG_FILE = process.env.DR_LOG || join(__dirname, '..', 'data', 'events.log');
+// 密钥 sidecar 默认与事件日志同目录（换 DR_LOG 时自动跟随，避免与另一条历史链对账失败）
+const PACKAGE_KEY_FILE = process.env.DR_PACKAGE_KEYS || join(dirname(LOG_FILE), 'package-keys.json');
 
 const store = new EventStore(process.env.DR_MEMORY ? null : LOG_FILE);
+// 离线作业包私钥/HMAC 主密钥保存在日志旁 sidecar（链上只有公钥）；纯内存模式不落盘
+const packageKeys = new PackageKeyStore(process.env.DR_MEMORY ? null : PACKAGE_KEY_FILE);
 // 先从磁盘重放，再引导内核：空库才写入种子，避免重启后重复种子破坏哈希链。
 // 恢复契约：加载完成即确定模式——链损坏进入只读隔离（服务照常启动提供只读接口），
 // 末尾单条残尾则归档审计副本后截断并续链。
 await store.load();
 const recoveryStatus = store.verify();
-const kernel = new Kernel(store);
+const kernel = new Kernel(store, { packageKeys });
 if (!recoveryStatus.writable) {
   console.error('⛔ 事件日志已进入只读隔离：');
   console.error(`   首个损坏位置 seq=${recoveryStatus.brokenAt}（第 ${recoveryStatus.lineNo ?? '?'} 行，字节偏移 ${recoveryStatus.byteOffset ?? '?'}）`);
@@ -234,6 +239,100 @@ const server = createServer(async (req, res) => {
       return send(res, 200, out);
     }
 
+    // ---- 离线作业包：制包 / 领取 / 分段上传 / 释放 / 强制移交 / 验签 ----
+    if (path === '/api/packages' && req.method === 'POST') {
+      const out = kernel.dispatch({
+        type: 'ISSUE_PACKAGE',
+        eventId: body.eventId,
+        deviceIds: body.deviceIds,
+        validUntilMs: body.validUntilMs != null ? Number(body.validUntilMs) : undefined,
+        validForMinutes: body.validForMinutes != null ? Number(body.validForMinutes) : undefined,
+        createdBy: body.createdBy,
+      });
+      return send(res, 201, out);
+    }
+    if (path === '/api/packages' && req.method === 'GET') {
+      let list = kernel.packages.list();
+      const eventId = url.searchParams.get('eventId');
+      const status = url.searchParams.get('status');
+      if (eventId) list = list.filter((p) => p.eventId === eventId);
+      if (status) list = list.filter((p) => p.status === status);
+      return send(res, 200, { count: list.length, packages: list });
+    }
+    const pkgGet = path.match(/^\/api\/packages\/([^/]+)$/);
+    if (pkgGet && req.method === 'GET') {
+      const view = kernel.packages.view(decodeURIComponent(pkgGet[1]));
+      if (!view) return send(res, 404, { error: '作业包不存在', code: 'PACKAGE_NOT_FOUND' });
+      return send(res, 200, view);
+    }
+    const pkgVerify = path.match(/^\/api\/packages\/([^/]+)\/verify$/);
+    if (pkgVerify && req.method === 'GET') {
+      const out = kernel.packages.verify(decodeURIComponent(pkgVerify[1]));
+      if (!out) return send(res, 404, { error: '作业包不存在', code: 'PACKAGE_NOT_FOUND' });
+      return send(res, 200, out);
+    }
+    const pkgClaim = path.match(/^\/api\/packages\/([^/]+)\/claim$/);
+    if (pkgClaim && req.method === 'POST') {
+      const out = kernel.dispatch({
+        type: 'CLAIM_PACKAGE',
+        packageId: decodeURIComponent(pkgClaim[1]),
+        gatewayId: body.gatewayId,
+      });
+      return send(res, 200, out);
+    }
+    const pkgRelease = path.match(/^\/api\/packages\/([^/]+)\/release$/);
+    if (pkgRelease && req.method === 'POST') {
+      return send(res, 200, kernel.dispatch({
+        type: 'RELEASE_PACKAGE',
+        packageId: decodeURIComponent(pkgRelease[1]),
+        gatewayId: body.gatewayId,
+        reason: body.reason,
+      }));
+    }
+    const pkgHandover = path.match(/^\/api\/packages\/([^/]+)\/handover$/);
+    if (pkgHandover && req.method === 'POST') {
+      return send(res, 200, kernel.dispatch({
+        type: 'HANDOVER_PACKAGE',
+        packageId: decodeURIComponent(pkgHandover[1]),
+        toGatewayId: body.toGatewayId,
+        reason: body.reason,
+        by: body.by,
+      }));
+    }
+    const pkgSegments = path.match(/^\/api\/packages\/([^/]+)\/segments$/);
+    if (pkgSegments && req.method === 'POST') {
+      const out = kernel.dispatch({
+        type: 'UPLOAD_PACKAGE_SEGMENT',
+        packageId: decodeURIComponent(pkgSegments[1]),
+        fence: Number(body.fence),
+        segSeq: Number(body.segSeq),
+        gatewayId: body.gatewayId,
+        items: body.items,
+        digest: body.digest,
+      });
+      return send(res, 200, out);
+    }
+    // 演示用 SDK 小工具：按领取返回的 uploadSecret 计算分段 HMAC 摘要。
+    // 与服务端合并前的规范化完全一致（补全 detail、统一类型），网关应在本地实现同一规则。
+    if (path === '/api/packages/digest' && req.method === 'POST') {
+      const items = (body.items || []).map((it) => ({
+        seq: Number(it.seq),
+        deviceId: String(it.deviceId),
+        outcome: String(it.outcome),
+        detail: it.detail == null ? null : String(it.detail),
+      }));
+      const segBody = {
+        packageId: body.packageId,
+        fence: Number(body.fence),
+        segSeq: Number(body.segSeq),
+        items,
+      };
+      return send(res, 200, {
+        digest: hmacSegmentDigest(body.uploadSecret, pkgCanonicalJSON(segBody)),
+        segmentBody: segBody,
+      });
+    }
+
     // 报告详情 / 校验
     const reportMatch = path.match(/^\/api\/reports\/([^/]+)\/versions\/(\d+)$/);
     if (reportMatch && req.method === 'GET') {
@@ -276,6 +375,13 @@ const server = createServer(async (req, res) => {
       REQUEST_ID_CONFLICT: 409, DISPUTE_PENDING_EXISTS: 409, DISPUTE_DEADLINE_PASSED: 409,
       DISPUTE_TERMINAL: 409, DISPUTE_OWNER_MISMATCH: 409, MATERIAL_SEQ_CONFLICT: 409,
       REPORT_HASH_MISMATCH: 409, REPORT_NOT_FOUND: 404, DISPUTE_NOT_FOUND: 404,
+      PACKAGE_NOT_FOUND: 404,
+      PACKAGE_EVENT_NOT_CLAIMABLE: 409, DEVICE_ALREADY_PACKAGED: 409,
+      PACKAGE_ALREADY_CLAIMED: 409, PACKAGE_NOT_CLAIMED: 409,
+      PACKAGE_PROGRESS_LOCKED: 409, PACKAGE_FENCE_STALE: 409,
+      SEQ_CONTENT_CONFLICT: 409, SEGMENT_SEQ_CONFLICT: 409,
+      SEQ_OUT_OF_RANGE: 422, DEVICE_NOT_IN_PACKAGE: 422, DIGEST_MISMATCH: 422,
+      PACKAGE_CLOSED: 409, PACKAGE_EXPIRED: 409, PACKAGE_KEY_UNAVAILABLE: 503,
       LOG_QUARANTINED: 503,
       UNKNOWN_COMMAND: 400,
     };
